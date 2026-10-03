@@ -42,3 +42,11 @@ rustdoc-args = ["--cfg", "docsrs"]
 [[bench]]
 name = "overhead"
 harness = false
+
+[[example]]
+name = "redis_login"
+required-features = ["redis"]
+
+[[example]]
+name = "hybrid_shadow_mode"
+required-features = ["redis"]
