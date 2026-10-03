@@ -53,6 +53,8 @@
 #![deny(missing_docs)]
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "redis")]
+mod async_middleware;
 mod backend;
 mod builder;
 mod client_ip;
