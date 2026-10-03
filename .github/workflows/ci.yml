@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      redis:
+        image: redis:7.2-alpine
+        ports:
+          - 16379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 1s
+          --health-timeout 1s
+          --health-retries 30
+
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (feature matrix)
+        run: |
+          cargo clippy --all-targets -- -D warnings
+          cargo clippy --all-targets --features json -- -D warnings
+          cargo clippy --all-targets --features metrics -- -D warnings
+          cargo clippy --all-targets --features redis,json,metrics -- -D warnings
+
+      - name: No Redis crates without a Redis feature
+        run: |
+          if cargo tree -e normal --prefix none | grep -E '^redis '; then
+            echo "redis crates leaked into the no-feature tree" >&2
+            exit 1
+          fi
+
+      - name: Tests (no features)
+        run: cargo test
+
+      - name: Tests (redis)
+        run: cargo test --features redis,json,metrics
+
+      - name: Docs
+        run: |
+          RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+          RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --features redis,json,metrics
+
+  msrv:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust 1.88
+        uses: dtolnay/rust-toolchain@1.88
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check (no features)
+        run: cargo check --locked
+
+      - name: Check (redis, json, metrics)
+        run: cargo check --locked --features redis,json,metrics
