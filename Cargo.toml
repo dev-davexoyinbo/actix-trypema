@@ -38,3 +38,7 @@ proptest = "1"
 [package.metadata.docs.rs]
 features = ["redis", "json", "metrics"]
 rustdoc-args = ["--cfg", "docsrs"]
+
+[[bench]]
+name = "overhead"
+harness = false
