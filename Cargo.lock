@@ -2028,9 +2028,9 @@ dependencies = [
 
 [[package]]
 name = "trypema"
-version = "2.1.0"
+version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f61bc57745104b4fabeda1746138255ff8455fdde3dfd4ce6efe13bd00737b6"
+checksum = "f5d29c79264b924d42363b99a8ea476e899419ab24fd8aa4cd858f3b120a1e44"
 dependencies = [
  "ahash",
  "async-trait",

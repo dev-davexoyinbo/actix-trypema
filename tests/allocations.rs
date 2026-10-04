@@ -1,5 +1,5 @@
 //! The middleware's own admit path and allow-list lookup allocate nothing, for the client-IP and
-//! header extractors.
+//! header extractors, on the local and hybrid backends.
 //!
 //! This lives in its own test binary because it installs a global counting allocator, which
 //! needs `unsafe impl` — forbidden inside the crate itself. The `metrics` feature is excluded:
@@ -155,4 +155,48 @@ async fn header_keys_do_not_allocate() {
             "{label}"
         );
     }
+}
+
+#[cfg(feature = "redis")]
+#[actix_web::test]
+async fn hybrid_admit_path_does_not_allocate() {
+    use actix_trypema::Hybrid;
+    use trypema::{RateLimiterBuilder, redis::RedisKey};
+
+    let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:16379/".to_string());
+    let connection = redis::Client::open(url)
+        .unwrap()
+        .get_connection_manager()
+        .await
+        .unwrap();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .subsec_nanos();
+    let prefix = RedisKey::try_from(format!("at-alloc-{}-{nanos}", std::process::id())).unwrap();
+    let backend = Hybrid::configured(connection, WindowSize::seconds_or_panic(60), |builder| {
+        builder.prefix(prefix).disable_cleanup()
+    })
+    .unwrap();
+
+    let limiter = TrypemaLimiter::builder(backend)
+        .namespace("alloc")
+        .extractor(PeerIp::default())
+        .rate(RateLimit::per_second_or_panic(1e9))
+        .headers(HeaderMode::Off)
+        .build()
+        .unwrap();
+    let middleware = limiter
+        .new_transform(fn_service(|req: ServiceRequest| async move {
+            Ok::<_, actix_web::Error>(req.into_response(HttpResponse::Ok().finish()))
+        }))
+        .await
+        .unwrap();
+
+    let admitted = || request_from("203.0.113.7:9000").to_srv_request();
+
+    // The first request refreshes the key from Redis and the first local decision initializes
+    // trypema's lazy state; later admissions decide from local state without allocating.
+    middleware.call(admitted()).await.unwrap();
+    assert_eq!(steady_state_allocations(&middleware, admitted).await, 0);
 }

@@ -16,7 +16,9 @@ use crate::builder::Strategy;
 #[cfg(feature = "redis")]
 use trypema::{
     hybrid::{HybridRateLimiterBuilder, HybridRateLimiterProvider},
-    redis::{ConnectionManager, RedisKey, RedisRateLimiterBuilder, RedisRateLimiterProvider},
+    redis::{
+        ConnectionManager, RedisKey, RedisKeyRef, RedisRateLimiterBuilder, RedisRateLimiterProvider,
+    },
 };
 
 mod sealed {
@@ -149,6 +151,17 @@ pub trait AsyncBackend: Backend {
         rate: &RateLimit,
         cost: u64,
     ) -> impl Future<Output = Result<RateLimitDecision, TrypemaError>>;
+
+    /// Decide from local state without awaiting; `Ok(None)` means `backend_inc` is needed.
+    #[doc(hidden)]
+    fn try_backend_inc(
+        &self,
+        _strategy: Strategy,
+        _key: RedisKeyRef<'_>,
+        _cost: u64,
+    ) -> Result<Option<RateLimitDecision>, TrypemaError> {
+        Ok(None)
+    }
 
     /// Live `(total, declined)` usage for `key`.
     #[doc(hidden)]
@@ -348,6 +361,18 @@ impl AsyncBackend for Hybrid {
         match strategy {
             Strategy::Absolute => self.provider.absolute().inc(key, rate, cost).await,
             Strategy::Suppressed => self.provider.suppressed().inc(key, rate, cost).await,
+        }
+    }
+
+    fn try_backend_inc(
+        &self,
+        strategy: Strategy,
+        key: RedisKeyRef<'_>,
+        cost: u64,
+    ) -> Result<Option<RateLimitDecision>, TrypemaError> {
+        match strategy {
+            Strategy::Absolute => self.provider.absolute().try_inc(key, cost),
+            Strategy::Suppressed => self.provider.suppressed().try_inc(key, cost),
         }
     }
 

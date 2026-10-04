@@ -2,7 +2,6 @@
 
 use std::{
     future::Future,
-    pin::Pin,
     rc::Rc,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -14,19 +13,21 @@ use actix_web::{
     dev::{Service, ServiceRequest, ServiceResponse, forward_ready},
     http::StatusCode,
 };
-use trypema::{TrypemaError, redis::RedisKey};
+use trypema::{
+    RateLimitDecision, TrypemaError,
+    redis::{RedisKey, RedisKeyRef},
+};
 
 use crate::{
     BackendErrorPolicy, BackendFailure, ErrorAction,
     backend::{AsyncBackend, Local},
     builder::{Config, window_limit},
     middleware::{
-        Decision, Mapped, PreDecision, TrypemaMiddleware, admitted_outcome, map_decision,
-        permissive_outcome, pre_decide, record_backend_latency, record_decision, record_outcome,
-        remaining,
+        Decision, LimiterFuture, PreDecision, TrypemaMiddleware, finish, pre_decide,
+        record_backend_latency, record_decision, record_outcome, remaining,
     },
     outcome::LimitOutcome,
-    response::{AdmitHeaders, build_rejection},
+    response::AdmitHeaders,
 };
 
 impl<S, Bd, B> Service<ServiceRequest> for TrypemaMiddleware<S, B>
@@ -37,18 +38,42 @@ where
 {
     type Response = ServiceResponse<EitherBody<Bd>>;
     type Error = Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>>>>;
+    type Future = LimiterFuture<S::Future, Bd>;
 
     forward_ready!(service);
 
     fn call(&self, req: ServiceRequest) -> Self::Future {
         // Everything that borrows the request runs before the first await.
         let pre = pre_decide(&self.config, &req);
+
+        // Hybrid decides most requests from local state, validating the key without allocating
+        // a RedisKey or boxing a future. Only Redis work takes the timed path below. An invalid
+        // key or an `Err` (unusable local state) takes it too, where `RedisKey` validation and
+        // the failure policy handle it once.
+        if let PreDecision::Proceed { key, rate, cost } = &pre
+            && !self.config.remaining_header
+            && let Ok(key) = RedisKeyRef::try_from(key.as_str())
+            && let Ok(Some(decision)) =
+                self.backend
+                    .try_backend_inc(self.config.strategy, key, *cost)
+        {
+            let limit = window_limit(rate, self.config.window_size);
+            return finish(
+                &self.config,
+                &*self.service,
+                req,
+                key.as_str(),
+                limit,
+                decision,
+                || None,
+            );
+        }
+
         let config = Arc::clone(&self.config);
         let backend = self.backend.clone();
         let service = Rc::clone(&self.service);
 
-        Box::pin(async move {
+        LimiterFuture::boxed(Box::pin(async move {
             let (key, rate, cost) = match pre {
                 PreDecision::Bypass => {
                     record_decision(&config, Decision::Bypassed);
@@ -129,36 +154,33 @@ where
                 }
             };
 
-            match map_decision(&config, key.as_str(), limit, decision) {
-                Mapped::Admit { suppression } => {
-                    let remaining =
-                        read_remaining(&config, &backend, fallback.as_ref(), &redis_key, limit)
-                            .await;
-                    record_decision(&config, Decision::Admitted);
-                    record_outcome(&config, &req, || {
-                        admitted_outcome(limit, remaining, suppression)
-                    });
-                    let headers = AdmitHeaders::new(&config, limit, remaining, suppression);
-                    forward(&*service, req, headers).await
-                }
-                Mapped::Reject(info) => {
-                    record_decision(&config, Decision::Rejected);
+            // `finish` reports the remaining count only on admission or in permissive mode.
+            let reports_remaining = config.permissive
+                || matches!(
+                    decision,
+                    RateLimitDecision::Allowed
+                        | RateLimitDecision::Suppressed {
+                            is_allowed: true,
+                            ..
+                        }
+                );
+            let remaining = if reports_remaining {
+                read_remaining(&config, &backend, fallback.as_ref(), &redis_key, limit).await
+            } else {
+                None
+            };
 
-                    if config.permissive {
-                        let remaining =
-                            read_remaining(&config, &backend, fallback.as_ref(), &redis_key, limit)
-                                .await;
-                        record_outcome(&config, &req, || permissive_outcome(&info));
-                        let headers =
-                            AdmitHeaders::new(&config, limit, remaining, info.suppression_factor);
-                        return forward(&*service, req, headers).await;
-                    }
-
-                    let response = build_rejection(&config, &info);
-                    Ok(req.into_response(response).map_into_right_body())
-                }
-            }
-        })
+            finish(
+                &config,
+                &*service,
+                req,
+                key.as_str(),
+                limit,
+                decision,
+                || remaining,
+            )
+            .await
+        }))
     } // end method call
 } // end impl
 

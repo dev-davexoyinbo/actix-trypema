@@ -63,7 +63,7 @@ where
 {
     type Response = ServiceResponse<EitherBody<Bd>>;
     type Error = Error;
-    type Future = LocalFuture<S::Future, Bd>;
+    type Future = LimiterFuture<S::Future, Bd>;
 
     forward_ready!(service);
 
@@ -74,11 +74,11 @@ where
             PreDecision::Bypass => {
                 record_decision(config, Decision::Bypassed);
                 record_outcome(config, &req, || LimitOutcome::Bypassed);
-                return LocalFuture::forward(self.service.call(req), None);
+                return LimiterFuture::forward(self.service.call(req), None);
             }
             PreDecision::KeyRejected(error) => {
                 record_decision(config, Decision::Rejected);
-                return LocalFuture::ready(Err(error.into()));
+                return LimiterFuture::ready(Err(error.into()));
             }
             PreDecision::Proceed { key, rate, cost } => (key, rate, cost),
         };
@@ -86,34 +86,15 @@ where
         let limit = window_limit(&rate, config.window_size);
         let decision = self.backend.inc(config.strategy, key.as_str(), &rate, cost);
 
-        match map_decision(config, key.as_str(), limit, decision) {
-            Mapped::Admit { suppression } => {
-                let remaining = self.read_remaining(key.as_str(), limit);
-                record_decision(config, Decision::Admitted);
-                record_outcome(config, &req, || {
-                    admitted_outcome(limit, remaining, suppression)
-                });
-                LocalFuture::forward(
-                    self.service.call(req),
-                    AdmitHeaders::new(config, limit, remaining, suppression),
-                )
-            }
-            Mapped::Reject(info) => {
-                record_decision(config, Decision::Rejected);
-
-                if config.permissive {
-                    let remaining = self.read_remaining(key.as_str(), limit);
-                    record_outcome(config, &req, || permissive_outcome(&info));
-                    return LocalFuture::forward(
-                        self.service.call(req),
-                        AdmitHeaders::new(config, limit, remaining, info.suppression_factor),
-                    );
-                }
-
-                let response = build_rejection(config, &info);
-                LocalFuture::ready(Ok(req.into_response(response).map_into_right_body()))
-            }
-        }
+        finish(
+            config,
+            &*self.service,
+            req,
+            key.as_str(),
+            limit,
+            decision,
+            || self.read_remaining(key.as_str(), limit),
+        )
     } // end method call
 } // end impl
 
@@ -126,17 +107,24 @@ impl<S> TrypemaMiddleware<S, Local> {
     }
 } // end impl
 
+/// The response future of a decision that awaits Redis.
+pub(crate) type BoxedResponse<Bd> =
+    Pin<Box<dyn Future<Output = Result<ServiceResponse<EitherBody<Bd>>, Error>>>>;
+
 pin_project! {
-    /// The local backend's unboxed service future.
-    pub struct LocalFuture<F, Bd> {
+    /// The middleware's service future.
+    ///
+    /// Unboxed whenever the decision is made without awaiting: always for the local backend,
+    /// and for most hybrid requests.
+    pub struct LimiterFuture<F, Bd> {
         #[pin]
-        state: LocalFutureState<F, Bd>,
+        state: LimiterFutureState<F, Bd>,
     }
 }
 
 pin_project! {
-    #[project = LocalFutureStateProj]
-    enum LocalFutureState<F, Bd> {
+    #[project = LimiterFutureStateProj]
+    enum LimiterFutureState<F, Bd> {
         Forward {
             #[pin]
             fut: F,
@@ -145,26 +133,39 @@ pin_project! {
         Ready {
             response: Option<Result<ServiceResponse<EitherBody<Bd>>, Error>>,
         },
+        Boxed {
+            fut: BoxedResponse<Bd>,
+        },
     }
 }
 
-impl<F, Bd> LocalFuture<F, Bd> {
+impl<F, Bd> LimiterFuture<F, Bd> {
     fn forward(fut: F, headers: Option<AdmitHeaders>) -> Self {
         Self {
-            state: LocalFutureState::Forward { fut, headers },
+            state: LimiterFutureState::Forward { fut, headers },
         }
     }
 
     fn ready(response: Result<ServiceResponse<EitherBody<Bd>>, Error>) -> Self {
         Self {
-            state: LocalFutureState::Ready {
+            state: LimiterFutureState::Ready {
                 response: Some(response),
             },
         }
     }
+
+    #[cfg_attr(
+        not(feature = "redis"),
+        expect(dead_code, reason = "only the async backends box")
+    )]
+    pub(crate) fn boxed(fut: BoxedResponse<Bd>) -> Self {
+        Self {
+            state: LimiterFutureState::Boxed { fut },
+        }
+    }
 } // end impl
 
-impl<F, Bd> Future for LocalFuture<F, Bd>
+impl<F, Bd> Future for LimiterFuture<F, Bd>
 where
     F: Future<Output = Result<ServiceResponse<Bd>, Error>>,
     Bd: MessageBody,
@@ -173,7 +174,7 @@ where
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match self.project().state.project() {
-            LocalFutureStateProj::Forward { fut, headers } => match fut.poll(cx) {
+            LimiterFutureStateProj::Forward { fut, headers } => match fut.poll(cx) {
                 Poll::Ready(Ok(mut response)) => {
                     if let Some(headers) = headers.take() {
                         headers.apply(response.headers_mut());
@@ -185,11 +186,12 @@ where
                 Poll::Pending => Poll::Pending,
             },
             // Futures are not polled again after completing, so the response is always present.
-            LocalFutureStateProj::Ready { response } => Poll::Ready(
+            LimiterFutureStateProj::Ready { response } => Poll::Ready(
                 response
                     .take()
-                    .expect("LocalFuture polled after completion"),
+                    .expect("LimiterFuture polled after completion"),
             ),
+            LimiterFutureStateProj::Boxed { fut } => fut.as_mut().poll(cx),
         }
     } // end method poll
 } // end impl
@@ -256,6 +258,52 @@ pub(crate) fn pre_decide(config: &Config, req: &ServiceRequest) -> PreDecision {
 
     PreDecision::Proceed { key, rate, cost }
 } // end fn pre_decide
+
+/// Turn a backend decision into the response: forward (with headers) or reject.
+///
+/// `read_remaining` runs only when the remaining count is reported, on admission or in
+/// permissive mode.
+pub(crate) fn finish<S, Bd>(
+    config: &Config,
+    service: &S,
+    req: ServiceRequest,
+    key: &str,
+    limit: u64,
+    decision: RateLimitDecision,
+    read_remaining: impl FnOnce() -> Option<u64>,
+) -> LimiterFuture<S::Future, Bd>
+where
+    S: Service<ServiceRequest, Response = ServiceResponse<Bd>, Error = Error>,
+{
+    match map_decision(config, key, limit, decision) {
+        Mapped::Admit { suppression } => {
+            let remaining = read_remaining();
+            record_decision(config, Decision::Admitted);
+            record_outcome(config, &req, || {
+                admitted_outcome(limit, remaining, suppression)
+            });
+            LimiterFuture::forward(
+                service.call(req),
+                AdmitHeaders::new(config, limit, remaining, suppression),
+            )
+        }
+        Mapped::Reject(info) => {
+            record_decision(config, Decision::Rejected);
+
+            if config.permissive {
+                let remaining = read_remaining();
+                record_outcome(config, &req, || permissive_outcome(&info));
+                return LimiterFuture::forward(
+                    service.call(req),
+                    AdmitHeaders::new(config, limit, remaining, info.suppression_factor),
+                );
+            }
+
+            let response = build_rejection(config, &info);
+            LimiterFuture::ready(Ok(req.into_response(response).map_into_right_body()))
+        }
+    }
+} // end fn finish
 
 pub(crate) enum Mapped {
     Admit { suppression: Option<f64> },

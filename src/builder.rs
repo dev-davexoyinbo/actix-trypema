@@ -257,7 +257,8 @@ impl<B: Backend> TrypemaLimiterBuilder<B> {
     /// Also send the remaining quota on admitted responses.
     ///
     /// Costs one extra provider read per request: in-memory for Local, a Redis round trip for
-    /// Redis, and a local estimate for Hybrid.
+    /// Redis, and a local estimate for Hybrid, which then also takes its async path instead of
+    /// deciding synchronously from local state.
     pub fn remaining_header(mut self, enabled: bool) -> Self {
         self.remaining_header = enabled;
         self
