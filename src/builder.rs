@@ -16,7 +16,7 @@ use crate::{
 #[cfg(feature = "redis")]
 use crate::backend::AsyncBackend;
 
-const DEFAULT_BACKEND_TIMEOUT: Duration = Duration::from_millis(50);
+const DEFAULT_BACKEND_TIMEOUT: Duration = Duration::from_millis(200);
 
 pub(crate) type RateFn = Arc<dyn Fn(&ServiceRequest, &str) -> RateLimit + Send + Sync>;
 pub(crate) type CostFn = Arc<dyn Fn(&ServiceRequest) -> u64 + Send + Sync>;
@@ -417,7 +417,7 @@ impl<B: AsyncBackend> TrypemaLimiterBuilder<B> {
         self
     }
 
-    /// Bound each backend call. Defaults to 50 ms; a timeout counts as a backend failure, and
+    /// Bound each backend call. Defaults to 200 ms; a timeout counts as a backend failure, and
     /// `build()` rejects zero.
     pub fn backend_timeout(mut self, timeout: Duration) -> Self {
         self.backend_timeout = timeout;

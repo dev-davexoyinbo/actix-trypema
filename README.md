@@ -290,7 +290,7 @@ let hybrid = Hybrid::configured(connection, window, |builder| {
 `Hybrid` decides most requests from local state without awaiting; only requests that need Redis
 take the async path. An instance's view of the others lags by up to one sync interval.
 
-**When Redis fails.** Every Redis and hybrid call is bounded by `backend_timeout` (50 ms by
+**When Redis fails.** Every Redis and hybrid call is bounded by `backend_timeout` (200 ms by
 default), and failures follow `on_backend_error`:
 
 | Policy | On failure |
