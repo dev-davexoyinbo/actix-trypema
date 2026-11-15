@@ -8,17 +8,15 @@ use std::{fmt, sync::Arc};
 
 use trypema::{
     RateLimit, RateLimitDecision, RateLimiterBuilder, TrypemaError, WindowSize,
-    local::{LocalRateLimiterBuilder, LocalRateLimiterProvider},
+    local::{LocalBackend, LocalRateLimiterProvider},
 };
 
 use crate::builder::Strategy;
 
 #[cfg(feature = "redis")]
 use trypema::{
-    hybrid::{HybridRateLimiterBuilder, HybridRateLimiterProvider},
-    redis::{
-        ConnectionManager, RedisKey, RedisKeyRef, RedisRateLimiterBuilder, RedisRateLimiterProvider,
-    },
+    hybrid::{HybridBackend, HybridRateLimiterProvider},
+    redis::{ConnectionManager, RedisBackend, RedisKey, RedisKeyRef, RedisRateLimiterProvider},
 };
 
 mod sealed {
@@ -42,7 +40,7 @@ pub trait Backend: sealed::Sealed + Clone + 'static {
 ///
 /// ```
 /// use actix_trypema::Local;
-/// use trypema::{BucketSize, RateLimiterBuilder, WindowSize};
+/// use trypema::{BucketSize, WindowSize};
 ///
 /// let backend = Local::new(WindowSize::seconds_or_panic(60))?;
 ///
@@ -71,8 +69,9 @@ impl Local {
 
     /// Build an in-process provider, customizing any option except the window.
     ///
-    /// `configure` receives trypema's builder. The window is applied after it, so the provider
-    /// always enforces the window the middleware advertises.
+    /// `configure` receives trypema's provider builder,
+    /// `RateLimiterBuilder<LocalBackend, LocalRateLimiterProvider>`. The window is applied after
+    /// it, so the provider always enforces the window the middleware advertises.
     ///
     /// # Errors
     ///
@@ -80,7 +79,9 @@ impl Local {
     /// example a bucket size larger than the window.
     pub fn configured(
         window_size: WindowSize,
-        configure: impl FnOnce(LocalRateLimiterBuilder) -> LocalRateLimiterBuilder,
+        configure: impl FnOnce(
+            RateLimiterBuilder<LocalBackend, LocalRateLimiterProvider>,
+        ) -> RateLimiterBuilder<LocalBackend, LocalRateLimiterProvider>,
     ) -> Result<Self, TrypemaError> {
         let provider = configure(LocalRateLimiterProvider::builder())
             .window_size(window_size)
@@ -181,7 +182,7 @@ pub trait AsyncBackend: Backend {
 /// ```no_run
 /// # async fn example(connection: trypema::redis::ConnectionManager) -> Result<(), trypema::TrypemaError> {
 /// use actix_trypema::Redis;
-/// use trypema::{RateLimiterBuilder, WindowSize, redis::RedisKey};
+/// use trypema::{WindowSize, redis::RedisKey};
 ///
 /// let backend = Redis::configured(connection, WindowSize::seconds_or_panic(60), |builder| {
 ///     builder.prefix(RedisKey::try_from("my-service").unwrap())
@@ -211,7 +212,10 @@ impl Redis {
         Self::configured(connection, window_size, |builder| builder)
     }
 
-    /// Build a Redis provider, customizing any option except the window.
+    /// Build a Redis provider, customizing any option (such as `prefix`) except the window.
+    ///
+    /// `configure` receives trypema's provider builder,
+    /// `RateLimiterBuilder<RedisBackend, RedisRateLimiterProvider>`.
     ///
     /// # Errors
     ///
@@ -219,7 +223,9 @@ impl Redis {
     pub fn configured(
         connection: ConnectionManager,
         window_size: WindowSize,
-        configure: impl FnOnce(RedisRateLimiterBuilder) -> RedisRateLimiterBuilder,
+        configure: impl FnOnce(
+            RateLimiterBuilder<RedisBackend, RedisRateLimiterProvider>,
+        ) -> RateLimiterBuilder<RedisBackend, RedisRateLimiterProvider>,
     ) -> Result<Self, TrypemaError> {
         let provider = configure(RedisRateLimiterProvider::builder(connection))
             .window_size(window_size)
@@ -315,13 +321,18 @@ impl Hybrid {
     /// Build a hybrid provider, customizing any option (such as `sync_interval`) except the
     /// window.
     ///
+    /// `configure` receives trypema's provider builder,
+    /// `RateLimiterBuilder<HybridBackend, HybridRateLimiterProvider>`.
+    ///
     /// # Errors
     ///
     /// Returns the [`TrypemaError`] trypema's builder reports for an invalid configuration.
     pub fn configured(
         connection: ConnectionManager,
         window_size: WindowSize,
-        configure: impl FnOnce(HybridRateLimiterBuilder) -> HybridRateLimiterBuilder,
+        configure: impl FnOnce(
+            RateLimiterBuilder<HybridBackend, HybridRateLimiterProvider>,
+        ) -> RateLimiterBuilder<HybridBackend, HybridRateLimiterProvider>,
     ) -> Result<Self, TrypemaError> {
         let provider = configure(HybridRateLimiterProvider::builder(connection))
             .window_size(window_size)

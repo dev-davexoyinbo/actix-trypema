@@ -125,6 +125,8 @@
 //! it, so register `NormalizePath` to run before the limiter when exclusions rely on
 //! normalized paths.
 //!
+//! This version needs trypema 3.
+//!
 //! # Feature flags
 //!
 //! - `redis`: the Redis and hybrid backends, on trypema's tokio Redis client (the runtime
