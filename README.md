@@ -22,7 +22,7 @@ cargo add redis --features tokio-comp,connection-manager  # to connect to Redis
 | `json` | `JsonResponder`, a JSON body for rejections. |
 | `metrics` | Decision counters and a backend latency histogram through the `metrics` facade. |
 
-MSRV 1.88.
+actix-trypema 0.2 needs trypema 3. MSRV 1.88.
 
 ## Quick start
 
@@ -268,7 +268,7 @@ it.
 
 ```rust
 use actix_trypema::{Hybrid, Local, Redis};
-use trypema::{BucketSize, RateLimiterBuilder, WindowSize, hybrid::SyncInterval, redis::RedisKey};
+use trypema::{BucketSize, WindowSize, hybrid::SyncInterval, redis::RedisKey};
 
 let window = WindowSize::minutes_or_panic(1);
 let connection = redis::Client::open("redis://127.0.0.1:6379/")?
@@ -286,6 +286,9 @@ let hybrid = Hybrid::configured(connection, window, |builder| {
     builder.sync_interval(SyncInterval::milliseconds_or_panic(50))
 })?;
 ```
+
+`configured` gives the closure trypema's provider builder, for example
+`RateLimiterBuilder<HybridBackend, HybridRateLimiterProvider>`, and sets the window after it.
 
 `Hybrid` decides most requests from local state without awaiting; only requests that need Redis
 take the async path. An instance's view of the others lags by up to one sync interval.

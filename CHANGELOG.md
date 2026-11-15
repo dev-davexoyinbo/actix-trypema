@@ -5,6 +5,26 @@ This file records all notable changes to `actix-trypema`.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This crate uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - Unreleased
+
+### Changed
+
+- actix-trypema 0.2 needs trypema 3. It does not build with trypema 2.
+- The `configure` closure of `Local::configured`, `Redis::configured` and `Hybrid::configured`
+  takes and returns trypema 3's provider builder:
+  - `Local`: `RateLimiterBuilder<LocalBackend, LocalRateLimiterProvider>`.
+  - `Redis`: `RateLimiterBuilder<RedisBackend, RedisRateLimiterProvider>`.
+  - `Hybrid`: `RateLimiterBuilder<HybridBackend, HybridRateLimiterProvider>`.
+- A closure such as `|builder| builder.prefix(prefix).sync_interval(interval)` compiles without
+  changes. Code that names the trypema 2 types `LocalRateLimiterBuilder`,
+  `RedisRateLimiterBuilder` or `HybridRateLimiterBuilder` must use the types above.
+- You do not need `use trypema::RateLimiterBuilder;` to call the builder methods in the closure.
+- Redis key names do not change.
+
+### Requirements
+
+- trypema 3.0 or later.
+
 ## [0.1.1] - 2026-10-05
 
 ### Changed
