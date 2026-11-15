@@ -2,7 +2,7 @@
 
 use actix_trypema::Redis;
 use trypema::{
-    BucketSize, RateLimiterBuilder, WindowSize,
+    BucketSize, WindowSize,
     redis::{ConnectionManager, RedisKey},
 };
 

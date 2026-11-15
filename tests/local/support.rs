@@ -1,7 +1,7 @@
 //! Helpers for the local-backend integration tests.
 
 use actix_trypema::{Local, derived_key};
-use trypema::{BucketSize, RateLimiterBuilder, WindowSize};
+use trypema::{BucketSize, WindowSize};
 
 use crate::common::{CLIENT_KEY, WINDOW_SECS};
 

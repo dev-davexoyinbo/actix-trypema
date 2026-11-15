@@ -161,7 +161,7 @@ async fn header_keys_do_not_allocate() {
 #[actix_web::test]
 async fn hybrid_admit_path_does_not_allocate() {
     use actix_trypema::Hybrid;
-    use trypema::{RateLimiterBuilder, redis::RedisKey};
+    use trypema::redis::RedisKey;
 
     let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:16379/".to_string());
     let connection = redis::Client::open(url)

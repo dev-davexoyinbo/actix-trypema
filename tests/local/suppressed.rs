@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use actix_trypema::{Local, Strategy, TrypemaLimiter, extract::PeerIp};
 use actix_web::{App, http::StatusCode, test, web};
-use trypema::{BucketSize, RateLimit, RateLimiterBuilder, WindowSize};
+use trypema::{BucketSize, RateLimit, WindowSize};
 
 use crate::{
     common::{CLIENT, get, header, per_ip},

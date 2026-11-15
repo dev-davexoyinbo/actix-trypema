@@ -4,7 +4,7 @@ use actix_trypema::{
     Hybrid, LimitOutcome, RateLimitInfo, Strategy, TrypemaLimiter, extract::PeerIp,
 };
 use actix_web::{App, HttpResponse, Responder, http::StatusCode, test, web};
-use trypema::{BucketSize, RateLimit, RateLimiterBuilder, WindowSize};
+use trypema::{BucketSize, RateLimit, WindowSize};
 
 use crate::{
     common::{CLIENT, WINDOW_SECS, get, header, per_ip, status_or_error},
