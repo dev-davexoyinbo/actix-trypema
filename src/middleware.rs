@@ -79,7 +79,7 @@ where
 ///
 /// The `Kind` of a [`Backend`] selects the implementation. Two blanket `Service` impls, one
 /// for each backend trait, would overlap; two impls of this trait on two marker types do not.
-pub trait Drive<S: Service<ServiceRequest>, B, Bd> {
+pub(crate) trait Drive<S: Service<ServiceRequest>, B, Bd> {
     fn call(
         middleware: &TrypemaMiddleware<S, B>,
         req: ServiceRequest,
@@ -123,18 +123,16 @@ where
             key.as_str(),
             limit,
             decision,
-            || middleware.read_remaining(key.as_str(), limit),
+            || {
+                config.remaining_header.then(|| {
+                    let (total, declined) = middleware
+                        .backend
+                        .backend_usage(config.strategy, key.as_str());
+                    remaining(limit, total, declined)
+                })
+            },
         )
     } // end method call
-} // end impl
-
-impl<S, B: SyncBackend> TrypemaMiddleware<S, B> {
-    fn read_remaining(&self, key: &str, limit: u64) -> Option<u64> {
-        self.config.remaining_header.then(|| {
-            let (total, declined) = self.backend.backend_usage(self.config.strategy, key);
-            remaining(limit, total, declined)
-        })
-    }
 } // end impl
 
 /// The response future of a decision that awaits Redis.

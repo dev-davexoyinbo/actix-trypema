@@ -131,7 +131,7 @@ impl ProviderBackend for Arc<HybridRateLimiterProvider> {}
 /// The local backends: decided synchronously, in process.
 ///
 /// A single limiter ignores `strategy`: it always runs its own strategy.
-pub trait SyncBackend: Backend {
+pub(crate) trait SyncBackend: Backend {
     fn backend_inc(
         &self,
         strategy: Strategy,
