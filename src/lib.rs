@@ -6,8 +6,8 @@
 //! or limiter, in an `Arc`. Keys, rates, request costs, headers, rejection responses and backend
 //! failure handling are set per middleware instance.
 //!
-//! This crate re-exports [`trypema`], so `actix_trypema::trypema::RateLimiterBuilder` is the
-//! trypema version this crate uses.
+//! This version needs trypema 3.1. It re-exports [`trypema`], so
+//! `actix_trypema::trypema::RateLimiterBuilder` is the trypema version this crate uses.
 //!
 //! The [actix-web guide](https://trypema.davidoyinbo.com/actix-web) covers every option with
 //! examples.
@@ -66,6 +66,97 @@
 //! Redis and hybrid calls are bounded by `backend_timeout`, and failures follow
 //! [`BackendErrorPolicy`]: fail open (the default), fail closed, fall back to a local provider,
 //! or decide per failure.
+//!
+//! A Redis backend gives an exact limit across instances. Every instance that uses the same
+//! Redis and prefix shares the count. This login limit fails closed, so a Redis outage rejects
+//! logins:
+//!
+//! ```no_run
+//! # #[cfg(feature = "redis")]
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! use std::{sync::Arc, time::Duration};
+//!
+//! use actix_trypema::{BackendErrorPolicy, TrypemaLimiter, extract::PeerIp};
+//! use actix_trypema::trypema::{
+//!     RateLimit, RateLimiterBuilder, WindowSize,
+//!     redis::{AbsoluteRedisRateLimiter, RedisKey},
+//! };
+//! use actix_web::{App, web};
+//!
+//! let connection = redis::Client::open("redis://127.0.0.1:6379/")?
+//!     .get_connection_manager()
+//!     .await?;
+//!
+//! let backend: Arc<AbsoluteRedisRateLimiter> = RateLimiterBuilder::redis(connection)
+//!     .prefix(RedisKey::try_from("auth")?)
+//!     .window_size(WindowSize::minutes_or_panic(1))
+//!     .build()?;
+//!
+//! let limiter = TrypemaLimiter::builder(backend)
+//!     .namespace("login")
+//!     .extractor(PeerIp::default())
+//!     .rate(RateLimit::per_minute_or_panic(5.0))
+//!     .on_backend_error(BackendErrorPolicy::FailClosed)
+//!     .backend_timeout(Duration::from_millis(100))
+//!     .build()?;
+//!
+//! let app = App::new().service(
+//!     web::resource("/login")
+//!         .wrap(limiter.clone())
+//!         .route(web::post().to(|| async { "login" })),
+//! );
+//! # let _ = app;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! A hybrid backend decides most requests from local state and sends the counts to Redis at
+//! each sync interval. This API limit falls back to a local provider on the same window while
+//! Redis is not available, so each instance then limits on its own:
+//!
+//! ```no_run
+//! # #[cfg(feature = "redis")]
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! use std::sync::Arc;
+//!
+//! use actix_trypema::{BackendErrorPolicy, TrypemaLimiter, extract::PeerIp};
+//! use actix_trypema::trypema::{
+//!     RateLimit, RateLimiterBuilder, WindowSize,
+//!     hybrid::{AbsoluteHybridRateLimiter, SyncInterval},
+//!     local::LocalRateLimiterProvider,
+//!     redis::RedisKey,
+//! };
+//! use actix_web::{App, web};
+//!
+//! let window = WindowSize::minutes_or_panic(1);
+//! let connection = redis::Client::open("redis://127.0.0.1:6379/")?
+//!     .get_connection_manager()
+//!     .await?;
+//!
+//! let backend: Arc<AbsoluteHybridRateLimiter> = RateLimiterBuilder::hybrid(connection)
+//!     .prefix(RedisKey::try_from("api")?)
+//!     .window_size(window)
+//!     .sync_interval(SyncInterval::milliseconds_or_panic(50))
+//!     .build()?;
+//!
+//! let fallback: Arc<LocalRateLimiterProvider> = RateLimiterBuilder::local()
+//!     .window_size(window)
+//!     .build()?;
+//!
+//! let limiter = TrypemaLimiter::builder(backend)
+//!     .namespace("api")
+//!     .extractor(PeerIp::default())
+//!     .rate(RateLimit::per_minute_or_panic(600.0))
+//!     .on_backend_error(BackendErrorPolicy::Fallback(fallback))
+//!     .build()?;
+//!
+//! let app = App::new()
+//!     .wrap(limiter.clone())
+//!     .route("/", web::get().to(|| async { "hello" }));
+//! # let _ = app;
+//! # Ok(())
+//! # }
+//! ```
 //!
 //! # Keys
 //!
@@ -144,8 +235,6 @@
 //! resource declaring them. An `exclude` predicate sees the path as this middleware receives
 //! it, so register `NormalizePath` to run before the limiter when exclusions rely on
 //! normalized paths.
-//!
-//! This version needs trypema 3.1.
 //!
 //! # Feature flags
 //!

@@ -362,6 +362,121 @@ two settings.
 | `Fallback(provider)` | Decide with an `Arc<LocalRateLimiterProvider>` on the same window, per instance. The provider runs the strategy of the primary backend. |
 | `Custom(fn)` | Decide per `BackendFailure` (timeout or error). |
 
+### Redis backend
+
+An exact login limit, shared by every instance that uses the same Redis and prefix. It fails
+closed, so a Redis outage rejects logins:
+
+```rust
+use std::{sync::Arc, time::Duration};
+
+use actix_trypema::{
+    BackendErrorPolicy, TrypemaLimiter,
+    extract::PeerIp,
+    trypema::{
+        RateLimit, RateLimiterBuilder, WindowSize,
+        redis::{AbsoluteRedisRateLimiter, RedisKey},
+    },
+};
+use actix_web::{App, HttpServer, web};
+
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
+    let connection = redis::Client::open("redis://127.0.0.1:6379/")
+        .expect("valid Redis URL")
+        .get_connection_manager()
+        .await
+        .expect("Redis is available");
+
+    let backend: Arc<AbsoluteRedisRateLimiter> = RateLimiterBuilder::redis(connection)
+        .prefix(RedisKey::try_from("auth").expect("valid prefix"))
+        .window_size(WindowSize::minutes_or_panic(1))
+        .build()
+        .expect("valid backend");
+
+    let limiter = TrypemaLimiter::builder(backend)
+        .namespace("login")
+        .extractor(PeerIp::default())
+        .rate(RateLimit::per_minute_or_panic(5.0))
+        .on_backend_error(BackendErrorPolicy::FailClosed)
+        .backend_timeout(Duration::from_millis(100))
+        .build()
+        .expect("valid configuration");
+
+    HttpServer::new(move || {
+        App::new().service(
+            web::resource("/login")
+                .wrap(limiter.clone())
+                .route(web::post().to(|| async { "login" })),
+        )
+    })
+    .bind(("127.0.0.1", 8080))?
+    .run()
+    .await
+}
+```
+
+### Hybrid backend
+
+An API limit for each client IP, decided from local state for most requests and sent to Redis
+every 50 ms. While Redis is not available, a local provider on the same window decides, so each
+instance limits on its own:
+
+```rust
+use std::sync::Arc;
+
+use actix_trypema::{
+    BackendErrorPolicy, TrypemaLimiter,
+    extract::PeerIp,
+    trypema::{
+        RateLimit, RateLimiterBuilder, WindowSize,
+        hybrid::{AbsoluteHybridRateLimiter, SyncInterval},
+        local::LocalRateLimiterProvider,
+        redis::RedisKey,
+    },
+};
+use actix_web::{App, HttpServer, web};
+
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
+    let window = WindowSize::minutes_or_panic(1);
+    let connection = redis::Client::open("redis://127.0.0.1:6379/")
+        .expect("valid Redis URL")
+        .get_connection_manager()
+        .await
+        .expect("Redis is available");
+
+    let backend: Arc<AbsoluteHybridRateLimiter> = RateLimiterBuilder::hybrid(connection)
+        .prefix(RedisKey::try_from("api").expect("valid prefix"))
+        .window_size(window)
+        .sync_interval(SyncInterval::milliseconds_or_panic(50))
+        .build()
+        .expect("valid backend");
+
+    let fallback: Arc<LocalRateLimiterProvider> = RateLimiterBuilder::local()
+        .window_size(window)
+        .build()
+        .expect("valid fallback");
+
+    let limiter = TrypemaLimiter::builder(backend)
+        .namespace("api")
+        .extractor(PeerIp::default())
+        .rate(RateLimit::per_minute_or_panic(600.0))
+        .on_backend_error(BackendErrorPolicy::Fallback(fallback))
+        .build()
+        .expect("valid configuration");
+
+    HttpServer::new(move || {
+        App::new()
+            .wrap(limiter.clone())
+            .route("/", web::get().to(|| async { "hello" }))
+    })
+    .bind(("127.0.0.1", 8080))?
+    .run()
+    .await
+}
+```
+
 ## Responses
 
 Rejections get `429`, `retry-after` in whole seconds, the rate limit headers, and a body from the
