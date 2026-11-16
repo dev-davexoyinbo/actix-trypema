@@ -11,33 +11,46 @@ behind load balancers and CDNs.
 ## Install
 
 ```sh
-cargo add actix-trypema trypema          # trypema provides RateLimit and WindowSize
-cargo add actix-trypema --features redis # Redis and Hybrid backends
+cargo add actix-trypema
+cargo add actix-trypema --features redis # Redis and hybrid backends
 cargo add redis --features tokio-comp,connection-manager  # to connect to Redis
 ```
 
+actix-trypema re-exports trypema, so `actix_trypema::trypema::{RateLimit, RateLimiterBuilder,
+WindowSize}` is the trypema version that actix-trypema uses. A separate `trypema` dependency is
+optional. If you add one, it must be the same version as the one actix-trypema uses (3.1).
+Otherwise the types do not match.
+
 | Feature | Adds |
 |---|---|
-| `redis` | The `Redis` and `Hybrid` backends, on tokio (the runtime actix-web runs on). |
+| `redis` | The Redis and hybrid backends (two providers and four limiters), on tokio (the runtime actix-web runs on). It turns on `trypema/redis-tokio`. |
 | `json` | `JsonResponder`, a JSON body for rejections. |
 | `metrics` | Decision counters and a backend latency histogram through the `metrics` facade. |
 
-actix-trypema 0.2 needs trypema 3. MSRV 1.88.
+actix-trypema 0.2 needs trypema 3.1. MSRV 1.88.
 
 ## Quick start
 
 Sixty requests per minute per client IP:
 
 ```rust
-use actix_trypema::{Local, TrypemaLimiter, extract::PeerIp};
+use std::sync::Arc;
+
+use actix_trypema::{
+    TrypemaLimiter,
+    extract::PeerIp,
+    trypema::{RateLimit, RateLimiterBuilder, WindowSize, local::AbsoluteLocalRateLimiter},
+};
 use actix_web::{App, HttpServer, web};
-use trypema::{RateLimit, WindowSize};
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     // Build the backend once, outside HttpServer::new: inside the closure every worker would
     // get its own counters, multiplying the effective limit by the worker count.
-    let backend = Local::new(WindowSize::seconds_or_panic(60)).expect("valid backend");
+    let backend: Arc<AbsoluteLocalRateLimiter> = RateLimiterBuilder::local()
+        .window_size(WindowSize::seconds_or_panic(60))
+        .build()
+        .expect("valid backend");
 
     let limiter = TrypemaLimiter::builder(backend)
         .namespace("ip")
@@ -60,8 +73,8 @@ async fn main() -> std::io::Result<()> {
 The 61st request within a minute gets `429 Too Many Requests` with a `retry-after` header and
 never reaches the handler.
 
-Every limiter has a **backend** (where counts live), an **extractor** (who a request is), a
-**rate**, and a **namespace** (`[a-z0-9-]{1,32}`). The namespace keeps limiters that share a
+Every limiter has a **backend** (where counts live: a trypema provider or limiter), an
+**extractor** (who a request is), a **rate**, and a **namespace** (`[a-z0-9-]{1,32}`). The namespace keeps limiters that share a
 backend apart, and names the limiter in headers, outcomes, metrics and logs. `build()` checks
 the configuration and returns a `ConfigError` instead of failing at request time.
 
@@ -82,13 +95,19 @@ address is in `X-Forwarded-For`. `RealIp::xff` reads that header **only** when t
 one of your `TrustedProxies`:
 
 ```rust
-use actix_trypema::{Local, TrypemaLimiter, extract::{RealIp, TrustedProxies}};
-use trypema::{RateLimit, WindowSize};
+use std::sync::Arc;
+
+use actix_trypema::{TrypemaLimiter, extract::{RealIp, TrustedProxies}};
+use actix_trypema::trypema::{RateLimit, RateLimiterBuilder, WindowSize, local::AbsoluteLocalRateLimiter};
 
 // The load balancers in front of the app, and nothing else.
 let trusted = TrustedProxies::new(["10.0.0.0/16"])?;
 
-let limiter = TrypemaLimiter::builder(Local::new(WindowSize::seconds_or_panic(60))?)
+let backend: Arc<AbsoluteLocalRateLimiter> = RateLimiterBuilder::local()
+    .window_size(WindowSize::seconds_or_panic(60))
+    .build()?;
+
+let limiter = TrypemaLimiter::builder(backend)
     .namespace("ip")
     .extractor(RealIp::xff(trusted))
     .rate(RateLimit::per_minute_or_panic(60.0))
@@ -150,15 +169,21 @@ client, and every new value gets a fresh bucket.
 authentication middleware, path parameters, cookies, or a validated lookup.
 
 ```rust
-use actix_trypema::{KeyError, Local, TrypemaLimiter};
+use std::sync::Arc;
+
+use actix_trypema::{KeyError, TrypemaLimiter};
+use actix_trypema::trypema::{RateLimit, RateLimiterBuilder, WindowSize, local::AbsoluteLocalRateLimiter};
 use actix_web::HttpMessage;
-use trypema::{RateLimit, WindowSize};
 
 /// Inserted by your authentication middleware.
 #[derive(Clone)]
 struct UserId(u64);
 
-let per_user = TrypemaLimiter::builder(Local::new(WindowSize::seconds_or_panic(60))?)
+let backend: Arc<AbsoluteLocalRateLimiter> = RateLimiterBuilder::local()
+    .window_size(WindowSize::seconds_or_panic(60))
+    .build()?;
+
+let per_user = TrypemaLimiter::builder(backend)
     .namespace("user")
     .extractor_fn(|req| {
         req.extensions()
@@ -213,13 +238,16 @@ When extraction fails, `on_key_error` decides: `Reject` (`400`, the default), `B
 ## Limits
 
 ```rust
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
-use actix_trypema::{KeyError, Local, Strategy, TrypemaLimiter, extract::PeerIp};
+use actix_trypema::{KeyError, Strategy, TrypemaLimiter, extract::PeerIp};
+use actix_trypema::trypema::{RateLimit, RateLimiterBuilder, WindowSize, local::LocalRateLimiterProvider};
 use actix_web::http::Method;
-use trypema::{RateLimit, WindowSize};
 
-let backend = Local::new(WindowSize::seconds_or_panic(60))?;
+// A provider holds both strategies, so each limiter on it can choose one.
+let backend: Arc<LocalRateLimiterProvider> = RateLimiterBuilder::local()
+    .window_size(WindowSize::seconds_or_panic(60))
+    .build()?;
 
 // Plan tiers: the plan is part of the key ("pro:account-2"), because trypema rates are sticky
 // per key and an upgrade should land in a new bucket.
@@ -260,47 +288,78 @@ it.
 
 ## Backends
 
-| Backend | Feature | Shared across instances | Cost per request |
-|---|---|---|---|
-| `Local` | none | No | In memory. |
-| `Redis` | `redis` | Yes, exactly | One Redis round trip; Redis 7.2+. |
-| `Hybrid` | `redis` | Yes, eventually: counts sync every interval | In memory for most requests. |
+The backend is trypema's own provider or limiter, in an `Arc`. Build it with trypema's
+`RateLimiterBuilder` and give it to `TrypemaLimiter::builder`. The middleware reads the window
+from the backend, so the advertised limit always agrees with the enforced limit.
+
+| Backend | Feature | Provider (both strategies) | Absolute limiter | Suppressed limiter |
+|---|---|---|---|---|
+| Local | none | `LocalRateLimiterProvider` | `AbsoluteLocalRateLimiter` | `SuppressedLocalRateLimiter` |
+| Redis | `redis` | `RedisRateLimiterProvider` | `AbsoluteRedisRateLimiter` | `SuppressedRedisRateLimiter` |
+| Hybrid | `redis` | `HybridRateLimiterProvider` | `AbsoluteHybridRateLimiter` | `SuppressedHybridRateLimiter` |
+
+The local types are in `trypema::local`, the Redis types in `trypema::redis`, and the hybrid
+types in `trypema::hybrid`.
+
+- A provider holds both strategies. `.strategy(Strategy::Suppressed)` selects the suppressed
+  strategy; the default is absolute.
+- A single limiter holds one strategy, and its type sets the strategy. Its builder has no
+  `.strategy(..)`. It does not create the state of the other strategy.
+- A limiter and a provider with the same prefix use the same Redis keys, so they share counts.
+
+| Backend | Shared across instances | Cost per request |
+|---|---|---|
+| Local | No | In memory. |
+| Redis | Yes, exactly | One Redis round trip; Redis 7.2+. |
+| Hybrid | Yes, eventually: counts sync every interval | In memory for most requests. |
 
 ```rust
-use actix_trypema::{Hybrid, Local, Redis};
-use trypema::{BucketSize, WindowSize, hybrid::SyncInterval, redis::RedisKey};
+use std::sync::Arc;
+
+use actix_trypema::trypema::{
+    BucketSize, RateLimiterBuilder, WindowSize,
+    hybrid::{AbsoluteHybridRateLimiter, SyncInterval},
+    local::LocalRateLimiterProvider,
+    redis::{RedisKey, SuppressedRedisRateLimiter},
+};
 
 let window = WindowSize::minutes_or_panic(1);
 let connection = redis::Client::open("redis://127.0.0.1:6379/")?
     .get_connection_manager()
     .await?;
 
-let local = Local::configured(window, |builder| {
-    builder.bucket_size(BucketSize::milliseconds_or_panic(50))
-})?;
+// Both strategies, in process.
+let local: Arc<LocalRateLimiterProvider> = RateLimiterBuilder::local()
+    .window_size(window)
+    .bucket_size(BucketSize::milliseconds_or_panic(50))
+    .build()?;
 
-let prefix = RedisKey::try_from("checkout-api")?; // services sharing one Redis
-let redis = Redis::configured(connection.clone(), window, |builder| builder.prefix(prefix))?;
+// The suppressed strategy only, exact across instances. The prefix keeps services that share
+// one Redis apart.
+let redis: Arc<SuppressedRedisRateLimiter> = RateLimiterBuilder::redis(connection.clone())
+    .prefix(RedisKey::try_from("checkout-api")?)
+    .window_size(window)
+    .build()?;
 
-let hybrid = Hybrid::configured(connection, window, |builder| {
-    builder.sync_interval(SyncInterval::milliseconds_or_panic(50))
-})?;
+// The absolute strategy only, shared through a local fast path.
+let hybrid: Arc<AbsoluteHybridRateLimiter> = RateLimiterBuilder::hybrid(connection)
+    .window_size(window)
+    .sync_interval(SyncInterval::milliseconds_or_panic(50))
+    .build()?;
 ```
 
-`configured` gives the closure trypema's provider builder, for example
-`RateLimiterBuilder<HybridBackend, HybridRateLimiterProvider>`, and sets the window after it.
-
-`Hybrid` decides most requests from local state without awaiting; only requests that need Redis
-take the async path. An instance's view of the others lags by up to one sync interval.
+A hybrid backend decides most requests from local state without awaiting; only requests that
+need Redis take the async path. An instance's view of the others lags by up to one sync interval.
 
 **When Redis fails.** Every Redis and hybrid call is bounded by `backend_timeout` (200 ms by
-default), and failures follow `on_backend_error`:
+default), and failures follow `on_backend_error`. Only the Redis and hybrid backends have these
+two settings.
 
 | Policy | On failure |
 |---|---|
 | `FailOpen` (default) | Admit: a limiter outage should not become an API outage. |
 | `FailClosed` | `503`. Use it on login, OTP and other abuse-prone routes. |
-| `Fallback(local)` | Decide with a `Local` backend on the same window, per instance. |
+| `Fallback(provider)` | Decide with an `Arc<LocalRateLimiterProvider>` on the same window, per instance. The provider runs the strategy of the primary backend. |
 | `Custom(fn)` | Decide per `BackendFailure` (timeout or error). |
 
 ## Responses
@@ -354,7 +413,7 @@ async fn handler(info: RateLimitInfo) -> impl Responder {
 }
 ```
 
-With stacked limiters, `info.for_namespace("ip")` reads one of them. Use `Strategy::Suppressed`
+With stacked limiters, `info.for_namespace("ip")` reads one of them. Use the suppressed strategy
 in shadow mode for accurate counts; absolute rejections record nothing in trypema.
 
 With the `metrics` feature, every limiter reports `ratelimit_admitted_total`,
@@ -363,23 +422,27 @@ With the `metrics` feature, every limiter reports `ratelimit_admitted_total`,
 
 ## Managing keys
 
-`derived_key(namespace, key)` returns the key a limiter stores. Pass it to the backend's provider
-to inspect a client, lift a block, or change its rate:
+`derived_key(namespace, key)` returns the key a limiter stores. Give it to your own backend value
+(keep a clone of the `Arc`) to inspect a client, lift a block, or change its rate:
 
 ```rust
-use actix_trypema::{Local, derived_key};
-use trypema::{RateLimit, WindowSize};
+use std::sync::Arc;
 
-let backend = Local::new(WindowSize::seconds_or_panic(60))?;
+use actix_trypema::derived_key;
+use actix_trypema::trypema::{RateLimit, RateLimiterBuilder, WindowSize, local::AbsoluteLocalRateLimiter};
+
+let backend: Arc<AbsoluteLocalRateLimiter> = RateLimiterBuilder::local()
+    .window_size(WindowSize::seconds_or_panic(60))
+    .build()?;
 let key = derived_key("ip", "203.0.113.7"); // "ip_r_203.0.113.7"
-let limiter = backend.provider().absolute();
 
-let used = limiter.get(&key);
-limiter.delete(&key); // the client's next request starts fresh
-limiter.set_rate_limit(&key, &RateLimit::per_minute_or_panic(600.0));
+let used = backend.get(&key);
+backend.delete(&key); // the client's next request starts fresh
+backend.set_rate_limit(&key, &RateLimit::per_minute_or_panic(600.0));
 ```
 
-With `Redis` and `Hybrid`, the same calls are async and take `RedisKey::try_from(key)?`.
+On a provider, select the strategy first: `backend.absolute().get(&key)`. With the Redis and
+hybrid backends, the same calls are async and take `RedisKey::try_from(key)?`.
 
 ## Performance
 
@@ -390,20 +453,20 @@ Time per request through actix's test harness with a no-op handler on an Apple M
 |---|---|---|---|
 | no limiter | — | 545 ns | — |
 | actix-governor (GCRA) | **no**: per-process counters | 611 ns | +66 ns |
-| actix-trypema `Local` | no | 673 ns | +128 ns |
-| actix-trypema `Hybrid` | yes, eventually consistent | 658 ns | +113 ns |
-| actix-trypema `Redis` | yes | 182 µs | one Redis round trip |
+| actix-trypema, local provider | no | 673 ns | +128 ns |
+| actix-trypema, hybrid provider | yes, eventually consistent | 658 ns | +113 ns |
+| actix-trypema, Redis provider | yes | 182 µs | one Redis round trip |
 
 > **actix-governor is not a distributed rate limiter.** Each process keeps its own counters, so
-> `n` instances admit `n` times the limit. Compare it with `Local`; `Hybrid` and `Redis` share one
-> limit across instances.
+> `n` instances admit `n` times the limit. Compare it with the local backend; the hybrid and Redis
+> backends share one limit across instances.
 
 - The total includes building the test request and running the handler (the "no limiter" row);
   the added column is the limiter's own cost.
 - Each figure is the median of three runs; between runs the added cost varied by up to 15 ns.
 - One client sends every request, the limit is never reached, and rate limit headers are off, so
   only the admit path is measured.
-- With headers off and without `metrics`, the `Local` and `Hybrid` admit paths allocate nothing
+- With headers off and without `metrics`, the local and hybrid admit paths allocate nothing
   (tests enforce it).
 
 There is no actix middleware for redis-cell. In trypema's own suite (100k keys, tokio), a
