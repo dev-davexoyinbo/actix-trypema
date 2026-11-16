@@ -2,8 +2,8 @@
 
 use std::{sync::Arc, time::Duration};
 
-use actix_trypema::derived_key;
-use actix_web::{App, http::StatusCode, test, web};
+use actix_trypema::{RejectionInfo, Strategy, derived_key};
+use actix_web::{App, dev::ServiceResponse, http::StatusCode, test, web};
 use trypema::{
     BucketSize, RateLimiterBuilder, WindowSize,
     hybrid::{
@@ -56,6 +56,39 @@ macro_rules! statuses {
 
         statuses
     }};
+}
+
+/// Send requests from `CLIENT` through `limiter` until one is rejected, and return it.
+macro_rules! first_rejection {
+    ($limiter:expr) => {{
+        let app = test::init_service(
+            App::new()
+                .wrap($limiter)
+                .route("/", web::get().to(|| async { "ok" })),
+        )
+        .await;
+        let mut rejected = None;
+
+        for _ in 0..10 {
+            let response = test::call_service(&app, get(CLIENT).to_request()).await;
+
+            if response.status() == StatusCode::TOO_MANY_REQUESTS {
+                rejected = Some(response);
+                break;
+            }
+        }
+
+        rejected.expect("a rejection within 10 requests")
+    }};
+}
+
+fn rejection_info<B>(response: &ServiceResponse<B>) -> RejectionInfo {
+    response
+        .response()
+        .extensions()
+        .get::<RejectionInfo>()
+        .cloned()
+        .unwrap()
 }
 
 const LIMITED: [StatusCode; 3] = [
@@ -116,6 +149,57 @@ async fn every_redis_and_hybrid_backend_type_limits_requests() {
     );
     assert_eq!(redis_absolute.get(&redis_key("ra")).await.unwrap(), 2);
     assert!(redis_suppressed.get(&redis_key("rs")).await.unwrap().total >= 2);
+}
+
+#[actix_web::test]
+async fn each_redis_and_hybrid_limiter_runs_its_own_strategy() {
+    let redis_absolute: Arc<AbsoluteRedisRateLimiter> =
+        redis_builder(&unique_prefix()).await.build().unwrap();
+    let redis_suppressed: Arc<SuppressedRedisRateLimiter> =
+        redis_builder(&unique_prefix()).await.build().unwrap();
+    let hybrid_absolute: Arc<AbsoluteHybridRateLimiter> =
+        hybrid_builder(&unique_prefix()).await.build().unwrap();
+    let hybrid_suppressed: Arc<SuppressedHybridRateLimiter> =
+        hybrid_builder(&unique_prefix()).await.build().unwrap();
+
+    // An absolute rejection has no suppression factor; a suppressed one always has one.
+    let info = rejection_info(&first_rejection!(
+        per_ip(&redis_absolute, "ra", 2.0).build().unwrap()
+    ));
+    assert_eq!(info.strategy, Strategy::Absolute, "redis absolute limiter");
+    assert!(info.suppression_factor.is_none(), "redis absolute limiter");
+
+    let info = rejection_info(&first_rejection!(
+        per_ip(&redis_suppressed, "rs", 2.0).build().unwrap()
+    ));
+    assert_eq!(
+        info.strategy,
+        Strategy::Suppressed,
+        "redis suppressed limiter"
+    );
+    assert!(
+        info.suppression_factor.is_some(),
+        "redis suppressed limiter"
+    );
+
+    let info = rejection_info(&first_rejection!(
+        per_ip(&hybrid_absolute, "ha", 2.0).build().unwrap()
+    ));
+    assert_eq!(info.strategy, Strategy::Absolute, "hybrid absolute limiter");
+    assert!(info.suppression_factor.is_none(), "hybrid absolute limiter");
+
+    let info = rejection_info(&first_rejection!(
+        per_ip(&hybrid_suppressed, "hs", 2.0).build().unwrap()
+    ));
+    assert_eq!(
+        info.strategy,
+        Strategy::Suppressed,
+        "hybrid suppressed limiter"
+    );
+    assert!(
+        info.suppression_factor.is_some(),
+        "hybrid suppressed limiter"
+    );
 }
 
 #[actix_web::test]
