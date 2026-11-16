@@ -1875,12 +1875,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
-name = "strum"
-version = "0.28.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9628de9b8791db39ceda2b119bbe13134770b56c138ec1d3af810d045c04f9bd"
-
-[[package]]
 name = "strum_macros"
 version = "0.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2114,9 +2108,9 @@ dependencies = [
 
 [[package]]
 name = "trypema"
-version = "3.0.0"
+version = "3.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c27f76452c87f80cfe4a05f04cbd13b4aaaa03d9bf1a6fdbb78ecaf4851ddf9b"
+checksum = "1db7d07d1564928efe02c1e99162b17751e2f18962caaf86d2c5df66f3a1ea73"
 dependencies = [
  "ahash",
  "async-trait",
@@ -2124,7 +2118,6 @@ dependencies = [
  "futures",
  "rand 0.10.3",
  "redis",
- "strum",
  "strum_macros",
  "thiserror",
  "tokio",
