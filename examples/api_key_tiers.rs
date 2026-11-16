@@ -10,9 +10,13 @@
 //! prints `200 200 200 429`, while the same loop with `pro-key` prints only `200`s. An unknown
 //! key gets `400`.
 
-use actix_trypema::{KeyError, Local, TrypemaLimiter};
+use std::sync::Arc;
+
+use actix_trypema::{
+    KeyError, TrypemaLimiter,
+    trypema::{RateLimit, RateLimiterBuilder, WindowSize, local::AbsoluteLocalRateLimiter},
+};
 use actix_web::{App, HttpServer, web};
-use trypema::{RateLimit, WindowSize};
 
 /// Stand-in for a real key store: API key → (account id, plan).
 const API_KEYS: [(&str, &str, &str); 2] = [
@@ -22,7 +26,10 @@ const API_KEYS: [(&str, &str, &str); 2] = [
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let backend = Local::new(WindowSize::seconds_or_panic(60)).expect("valid backend");
+    let backend: Arc<AbsoluteLocalRateLimiter> = RateLimiterBuilder::local()
+        .window_size(WindowSize::seconds_or_panic(60))
+        .build()
+        .expect("valid backend");
 
     let limiter = TrypemaLimiter::builder(backend)
         .namespace("apikey")

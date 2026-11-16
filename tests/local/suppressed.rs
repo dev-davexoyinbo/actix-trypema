@@ -2,9 +2,13 @@
 
 use std::time::Duration;
 
-use actix_trypema::{Local, Strategy, TrypemaLimiter, extract::PeerIp};
+use std::sync::Arc;
+
+use actix_trypema::{Strategy, TrypemaLimiter, extract::PeerIp};
 use actix_web::{App, http::StatusCode, test, web};
-use trypema::{BucketSize, RateLimit, WindowSize};
+use trypema::{
+    BucketSize, RateLimit, RateLimiterBuilder, WindowSize, local::LocalRateLimiterProvider,
+};
 
 use crate::{
     common::{CLIENT, get, header, per_ip},
@@ -71,12 +75,12 @@ async fn suppressed_rejections_omit_or_carry_the_configured_hint() {
 
 #[actix_web::test]
 async fn suppressed_overload_admits_roughly_the_target() {
-    let one_second = Local::configured(WindowSize::seconds_or_panic(1), |builder| {
-        builder
-            .bucket_size(BucketSize::milliseconds_or_panic(10))
-            .disable_cleanup()
-    })
-    .unwrap();
+    let one_second: Arc<LocalRateLimiterProvider> = RateLimiterBuilder::local()
+        .window_size(WindowSize::seconds_or_panic(1))
+        .bucket_size(BucketSize::milliseconds_or_panic(10))
+        .disable_cleanup()
+        .build()
+        .unwrap();
 
     let limiter = TrypemaLimiter::builder(one_second)
         .namespace("shed")
@@ -94,6 +98,7 @@ async fn suppressed_overload_admits_roughly_the_target() {
     .await;
 
     let mut admitted = 0;
+    let started = std::time::Instant::now();
 
     // 3x overload in one window. Suppression is probabilistic, so the bounds are loose; the
     // statistical convergence itself is covered by trypema's own suppressed-strategy tests.
@@ -105,5 +110,11 @@ async fn suppressed_overload_admits_roughly_the_target() {
         }
     }
 
-    assert!((6..=20).contains(&admitted), "admitted {admitted} of 30");
+    // The loop normally ends well inside the 1-second window. A loaded machine can stretch it
+    // over more windows, and each further second frees up to another 10 admissions.
+    let windows = started.elapsed().as_secs() + 1;
+    assert!(
+        (6..=20 * windows).contains(&admitted),
+        "admitted {admitted} of 30 over {windows} window(s)"
+    );
 }

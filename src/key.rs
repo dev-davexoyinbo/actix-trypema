@@ -43,9 +43,11 @@ pub(crate) fn validate_namespace(namespace: &str) -> Result<(), ConfigError> {
 /// Compute the key the middleware stores state under, for operator access.
 ///
 /// Pass the middleware's namespace and the extracted key (for client-IP extractors that is the
-/// dotted IPv4 address or the IPv6 `{network}/{prefix}` text). The result is what the limiter —
-/// local or Redis — was driven with, so it can be handed to the backend's provider directly, for
-/// example to lift a block with `delete` or change a tier with `set_rate_limit`.
+/// dotted IPv4 address or the IPv6 `{network}/{prefix}` text). The result is the key the
+/// middleware gives to the backend. Give it to your own backend value to lift a block with
+/// `delete` or change a tier with `set_rate_limit`: `backend.absolute().delete(..)` on a
+/// provider, `backend.delete(..)` on a single limiter. The Redis and hybrid calls are async and
+/// take `RedisKey::try_from(key)?`.
 ///
 /// The encoding is stable and injective: `{ns}_r_{key}` with `_` escaped as `__` and `:` as
 /// `_c`; keys whose raw form would exceed 255 bytes use `{ns}_h_{32 hex}` (SHA-256 prefix)

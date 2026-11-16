@@ -5,11 +5,12 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-use actix_trypema::{
-    Local, RateLimitInfo, RejectionInfo, TrypemaLimiter, derived_key, extract::PeerIp,
-};
+use actix_trypema::{RateLimitInfo, RejectionInfo, TrypemaLimiter, derived_key, extract::PeerIp};
 use actix_web::{App, HttpResponse, Responder, http::StatusCode, test, web};
-use trypema::{RateLimit, WindowSize};
+use trypema::{
+    RateLimit, RateLimiterBuilder, WindowSize,
+    local::{AbsoluteLocalRateLimiter, LocalRateLimiterProvider, SuppressedLocalRateLimiter},
+};
 
 use crate::{
     common::{CLIENT, CLIENT_KEY, WINDOW_SECS, get, header, per_ip},
@@ -20,7 +21,9 @@ use crate::{
 const _: () = {
     const fn assert_bounds<T: Clone + Send + Sync + 'static>() {}
 
-    assert_bounds::<TrypemaLimiter<Local>>();
+    assert_bounds::<TrypemaLimiter<Arc<LocalRateLimiterProvider>>>();
+    assert_bounds::<TrypemaLimiter<Arc<AbsoluteLocalRateLimiter>>>();
+    assert_bounds::<TrypemaLimiter<Arc<SuppressedLocalRateLimiter>>>();
 };
 
 #[actix_web::test]
@@ -75,7 +78,10 @@ async fn absolute_limits_then_rejects_with_retry_after() {
 
 #[actix_web::test]
 async fn advertised_limit_uses_the_backend_window() {
-    let two_minutes = Local::new(WindowSize::minutes_or_panic(2)).unwrap();
+    let two_minutes: Arc<LocalRateLimiterProvider> = RateLimiterBuilder::local()
+        .window_size(WindowSize::minutes_or_panic(2))
+        .build()
+        .unwrap();
     let limiter = TrypemaLimiter::builder(two_minutes)
         .namespace("ip")
         .extractor(PeerIp::default())

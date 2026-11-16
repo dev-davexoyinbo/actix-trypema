@@ -13,6 +13,7 @@ mod common;
 mod flaky_proxy;
 mod support;
 
+mod backends;
 mod failures;
 mod hybrid;
 mod limiting;

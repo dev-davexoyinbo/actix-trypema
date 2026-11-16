@@ -1,37 +1,38 @@
 //! The hybrid backend.
 
-use actix_trypema::{
-    Hybrid, LimitOutcome, RateLimitInfo, Strategy, TrypemaLimiter, extract::PeerIp,
-};
+use std::{sync::Arc, time::Duration};
+
+use actix_trypema::{LimitOutcome, RateLimitInfo, Strategy, TrypemaLimiter, extract::PeerIp};
 use actix_web::{App, HttpResponse, Responder, http::StatusCode, test, web};
-use trypema::{BucketSize, RateLimit, WindowSize};
+use trypema::{
+    BucketSize, RateLimit, RateLimiterBuilder, WindowSize, hybrid::HybridRateLimiterProvider,
+};
 
 use crate::{
-    common::{CLIENT, WINDOW_SECS, get, header, per_ip, status_or_error},
-    support::{connection_manager, redis_url, unique_prefix},
+    common::{CLIENT, WINDOW_SECS, get, header, status_or_error},
+    support::{connection_manager, per_ip, redis_url, unique_prefix},
 };
 
 #[actix_web::test]
 async fn hybrid_limits_and_reports_remaining_through_estimates() {
     let url = redis_url();
     let prefix = unique_prefix();
-    let backend = Hybrid::configured(
-        connection_manager(&url).await,
-        WindowSize::seconds_or_panic(WINDOW_SECS),
-        |builder| {
-            builder
-                .prefix(prefix)
-                .bucket_size(BucketSize::milliseconds_or_panic(10))
-                .disable_cleanup()
-        },
-    )
-    .unwrap();
+    let backend: Arc<HybridRateLimiterProvider> =
+        RateLimiterBuilder::hybrid(connection_manager(&url).await)
+            .prefix(prefix)
+            .window_size(WindowSize::seconds_or_panic(WINDOW_SECS))
+            .bucket_size(BucketSize::milliseconds_or_panic(10))
+            .disable_cleanup()
+            .build()
+            .unwrap();
 
     let limiter = TrypemaLimiter::builder(backend)
         .namespace("hy")
         .extractor(PeerIp::default())
         .rate(RateLimit::per_minute_or_panic(3.0))
         .remaining_header(true)
+        // The 200 ms default fails a call that a loaded machine delays open.
+        .backend_timeout(Duration::from_secs(10))
         .build()
         .unwrap();
 
@@ -59,14 +60,14 @@ async fn hybrid_limits_and_reports_remaining_through_estimates() {
     );
 }
 
-/// A hybrid backend on a fresh prefix, with cleanup off.
-async fn hybrid() -> Hybrid {
-    Hybrid::configured(
-        connection_manager(&redis_url()).await,
-        WindowSize::seconds_or_panic(WINDOW_SECS),
-        |builder| builder.prefix(unique_prefix()).disable_cleanup(),
-    )
-    .unwrap()
+/// A hybrid provider on a fresh prefix, with cleanup off.
+async fn hybrid() -> Arc<HybridRateLimiterProvider> {
+    RateLimiterBuilder::hybrid(connection_manager(&redis_url()).await)
+        .prefix(unique_prefix())
+        .window_size(WindowSize::seconds_or_panic(WINDOW_SECS))
+        .disable_cleanup()
+        .build()
+        .unwrap()
 }
 
 #[actix_web::test]

@@ -1,4 +1,4 @@
-//! The request pipeline shared by every backend, and the local backend's service.
+//! The request pipeline shared by every backend, and the local backends' request path.
 
 use std::{
     future::{Future, Ready, ready},
@@ -18,7 +18,7 @@ use trypema::{RateLimit, RateLimitDecision};
 
 use crate::{
     KeyError, KeyErrorPolicy,
-    backend::Local,
+    backend::{Backend, SyncBackend, sealed::SyncKind},
     builder::{Config, TrypemaLimiter, window_limit},
     extract::KeyBuf,
     key::compose_key,
@@ -56,10 +56,12 @@ where
     } // end method new_transform
 } // end impl
 
-impl<S, Bd> Service<ServiceRequest> for TrypemaMiddleware<S, Local>
+impl<S, Bd, B> Service<ServiceRequest> for TrypemaMiddleware<S, B>
 where
     S: Service<ServiceRequest, Response = ServiceResponse<Bd>, Error = Error>,
     Bd: MessageBody,
+    B: Backend,
+    B::Kind: Drive<S, B, Bd>,
 {
     type Response = ServiceResponse<EitherBody<Bd>>;
     type Error = Error;
@@ -68,13 +70,39 @@ where
     forward_ready!(service);
 
     fn call(&self, req: ServiceRequest) -> Self::Future {
-        let config = &self.config;
+        <B::Kind as Drive<S, B, Bd>>::call(self, req)
+    } // end method call
+} // end impl
+
+/// The request path of one backend kind: synchronous for the local backends, asynchronous for
+/// the Redis and hybrid backends.
+///
+/// The `Kind` of a [`Backend`] selects the implementation. Two blanket `Service` impls, one
+/// for each backend trait, would overlap; two impls of this trait on two marker types do not.
+pub trait Drive<S: Service<ServiceRequest>, B, Bd> {
+    fn call(
+        middleware: &TrypemaMiddleware<S, B>,
+        req: ServiceRequest,
+    ) -> LimiterFuture<S::Future, Bd>;
+}
+
+impl<S, Bd, B> Drive<S, B, Bd> for SyncKind
+where
+    S: Service<ServiceRequest, Response = ServiceResponse<Bd>, Error = Error>,
+    Bd: MessageBody,
+    B: SyncBackend,
+{
+    fn call(
+        middleware: &TrypemaMiddleware<S, B>,
+        req: ServiceRequest,
+    ) -> LimiterFuture<S::Future, Bd> {
+        let config = &middleware.config;
 
         let (key, rate, cost) = match pre_decide(config, &req) {
             PreDecision::Bypass => {
                 record_decision(config, Decision::Bypassed);
                 record_outcome(config, &req, || LimitOutcome::Bypassed);
-                return LimiterFuture::forward(self.service.call(req), None);
+                return LimiterFuture::forward(middleware.service.call(req), None);
             }
             PreDecision::KeyRejected(error) => {
                 record_decision(config, Decision::Rejected);
@@ -84,24 +112,26 @@ where
         };
 
         let limit = window_limit(&rate, config.window_size);
-        let decision = self.backend.inc(config.strategy, key.as_str(), &rate, cost);
+        let decision = middleware
+            .backend
+            .backend_inc(config.strategy, key.as_str(), &rate, cost);
 
         finish(
             config,
-            &*self.service,
+            &*middleware.service,
             req,
             key.as_str(),
             limit,
             decision,
-            || self.read_remaining(key.as_str(), limit),
+            || middleware.read_remaining(key.as_str(), limit),
         )
     } // end method call
 } // end impl
 
-impl<S> TrypemaMiddleware<S, Local> {
+impl<S, B: SyncBackend> TrypemaMiddleware<S, B> {
     fn read_remaining(&self, key: &str, limit: u64) -> Option<u64> {
         self.config.remaining_header.then(|| {
-            let (total, declined) = self.backend.usage(self.config.strategy, key);
+            let (total, declined) = self.backend.backend_usage(self.config.strategy, key);
             remaining(limit, total, declined)
         })
     }

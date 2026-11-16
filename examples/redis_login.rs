@@ -8,14 +8,14 @@
 //! `200`s and a `429`; the limit is shared by every instance pointing at the same Redis. Stop
 //! Redis (`docker compose stop`) and logins get `503` instead of slipping through.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use actix_trypema::{
-    BackendErrorPolicy, Redis, TrypemaLimiter,
+    BackendErrorPolicy, TrypemaLimiter,
     extract::{RealIp, TrustedProxies},
+    trypema::{RateLimit, RateLimiterBuilder, WindowSize, redis::AbsoluteRedisRateLimiter},
 };
 use actix_web::{App, HttpServer, web};
-use trypema::{RateLimit, WindowSize};
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
@@ -26,7 +26,10 @@ async fn main() -> std::io::Result<()> {
         .await
         .expect("redis reachable");
 
-    let backend = Redis::new(connection, WindowSize::minutes_or_panic(1)).expect("valid backend");
+    let backend: Arc<AbsoluteRedisRateLimiter> = RateLimiterBuilder::redis(connection)
+        .window_size(WindowSize::minutes_or_panic(1))
+        .build()
+        .expect("valid backend");
 
     // Headers are only trusted when the TCP peer is one of these load balancers; everything
     // else is keyed by its own address. A limiter outage rejects logins instead of waving

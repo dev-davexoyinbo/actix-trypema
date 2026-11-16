@@ -3,9 +3,7 @@
 use std::{fmt, sync::Arc, time::Duration};
 
 use actix_web::{HttpResponse, ResponseError, http::StatusCode};
-use trypema::TrypemaError;
-
-use crate::backend::Local;
+use trypema::{TrypemaError, local::LocalRateLimiterProvider};
 
 /// An invalid middleware configuration, reported by `build()` and validated constructors.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -135,12 +133,13 @@ pub enum BackendErrorPolicy {
     FailOpen,
     /// Reject the request with `503 Service Unavailable`.
     FailClosed,
-    /// Run the same admission check on a local backend, with the same derived key, rate, and
-    /// cost. Each app instance then enforces its own quota while the backend is unavailable, so
-    /// `n` instances admit up to `n` times the limit, and those counts are not carried back.
-    /// The local backend must use the primary's window. Recorded outcomes report the local
-    /// decision (`Admitted`, `Limited`), not `BackendError`.
-    Fallback(Local),
+    /// Run the same admission check on a local provider, with the same derived key, rate, cost,
+    /// and strategy. Each app instance then enforces its own quota while the backend is
+    /// unavailable, so `n` instances admit up to `n` times the limit, and those counts are not
+    /// carried back. The provider must use the primary's window. A provider holds both
+    /// strategies, so it serves an absolute and a suppressed primary. Recorded outcomes report
+    /// the local decision (`Admitted`, `Limited`), not `BackendError`.
+    Fallback(Arc<LocalRateLimiterProvider>),
     /// Decide per failure.
     Custom(Arc<dyn Fn(&BackendFailure) -> ErrorAction + Send + Sync>),
 }

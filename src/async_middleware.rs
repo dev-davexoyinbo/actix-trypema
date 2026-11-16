@@ -1,4 +1,5 @@
-//! The Redis and hybrid backends' service: the shared pipeline plus timeouts and failure policy.
+//! The Redis and hybrid backends' request path: the shared pipeline plus timeouts and failure
+//! policy.
 
 use std::{
     future::Future,
@@ -10,57 +11,56 @@ use std::{
 use actix_web::{
     Error, HttpResponse,
     body::{EitherBody, MessageBody},
-    dev::{Service, ServiceRequest, ServiceResponse, forward_ready},
+    dev::{Service, ServiceRequest, ServiceResponse},
     http::StatusCode,
 };
 use trypema::{
     RateLimitDecision, TrypemaError,
+    local::LocalRateLimiterProvider,
     redis::{RedisKey, RedisKeyRef},
 };
 
 use crate::{
     BackendErrorPolicy, BackendFailure, ErrorAction,
-    backend::{AsyncBackend, Local},
+    backend::{AsyncBackend, SyncBackend, sealed::AsyncKind},
     builder::{Config, window_limit},
     middleware::{
-        Decision, LimiterFuture, PreDecision, TrypemaMiddleware, finish, pre_decide,
+        Decision, Drive, LimiterFuture, PreDecision, TrypemaMiddleware, finish, pre_decide,
         record_backend_latency, record_decision, record_outcome, remaining,
     },
     outcome::LimitOutcome,
     response::AdmitHeaders,
 };
 
-impl<S, Bd, B> Service<ServiceRequest> for TrypemaMiddleware<S, B>
+impl<S, Bd, B> Drive<S, B, Bd> for AsyncKind
 where
     S: Service<ServiceRequest, Response = ServiceResponse<Bd>, Error = Error> + 'static,
     Bd: MessageBody + 'static,
     B: AsyncBackend,
 {
-    type Response = ServiceResponse<EitherBody<Bd>>;
-    type Error = Error;
-    type Future = LimiterFuture<S::Future, Bd>;
-
-    forward_ready!(service);
-
-    fn call(&self, req: ServiceRequest) -> Self::Future {
+    fn call(
+        middleware: &TrypemaMiddleware<S, B>,
+        req: ServiceRequest,
+    ) -> LimiterFuture<S::Future, Bd> {
         // Everything that borrows the request runs before the first await.
-        let pre = pre_decide(&self.config, &req);
+        let pre = pre_decide(&middleware.config, &req);
 
         // Hybrid decides most requests from local state, validating the key without allocating
         // a RedisKey or boxing a future. Only Redis work takes the timed path below. An invalid
         // key or an `Err` (unusable local state) takes it too, where `RedisKey` validation and
         // the failure policy handle it once.
         if let PreDecision::Proceed { key, rate, cost } = &pre
-            && !self.config.remaining_header
+            && !middleware.config.remaining_header
             && let Ok(key) = RedisKeyRef::try_from(key.as_str())
             && let Ok(Some(decision)) =
-                self.backend
-                    .try_backend_inc(self.config.strategy, key, *cost)
+                middleware
+                    .backend
+                    .try_backend_inc(middleware.config.strategy, key, *cost)
         {
-            let limit = window_limit(rate, self.config.window_size);
+            let limit = window_limit(rate, middleware.config.window_size);
             return finish(
-                &self.config,
-                &*self.service,
+                &middleware.config,
+                &*middleware.service,
                 req,
                 key.as_str(),
                 limit,
@@ -69,9 +69,9 @@ where
             );
         }
 
-        let config = Arc::clone(&self.config);
-        let backend = self.backend.clone();
-        let service = Rc::clone(&self.service);
+        let config = Arc::clone(&middleware.config);
+        let backend = middleware.backend.clone();
+        let service = Rc::clone(&middleware.service);
 
         LimiterFuture::boxed(Box::pin(async move {
             let (key, rate, cost) = match pre {
@@ -124,7 +124,8 @@ where
                     }
 
                     if let BackendErrorPolicy::Fallback(local) = &config.backend_error {
-                        let decision = local.inc(config.strategy, key.as_str(), &rate, cost);
+                        let decision =
+                            local.backend_inc(config.strategy, key.as_str(), &rate, cost);
                         (decision, Some(local.clone()))
                     } else {
                         let action = match &config.backend_error {
@@ -216,7 +217,7 @@ pub(crate) async fn timed<T>(
 async fn read_remaining<B: AsyncBackend>(
     config: &Config,
     backend: &B,
-    fallback: Option<&Local>,
+    fallback: Option<&Arc<LocalRateLimiterProvider>>,
     key: &RedisKey,
     limit: u64,
 ) -> Option<u64> {
@@ -225,7 +226,7 @@ async fn read_remaining<B: AsyncBackend>(
     }
 
     if let Some(local) = fallback {
-        let (total, declined) = local.usage(config.strategy, key.as_str());
+        let (total, declined) = local.backend_usage(config.strategy, key.as_str());
         return Some(remaining(limit, total, declined));
     }
 
