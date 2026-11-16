@@ -289,7 +289,8 @@ records changes.
 - A type from a new public dependency becomes part of the API. Get the approval of the owner
   first.
 - `[package.metadata.docs.rs]` lists all features. Add each new feature there.
-- The `exclude` list in `Cargo.toml` keeps `.github` and `compose.yaml` out of the package.
+- The `exclude` list in `Cargo.toml` keeps `.github`, the `Makefile` and `compose.yaml` out of the
+  package.
 - `Cargo.lock` is in git. The MSRV job uses it with `--locked`.
 
 ## 15. Change Discipline

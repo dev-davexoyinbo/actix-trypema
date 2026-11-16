@@ -10,7 +10,7 @@ documentation = "https://docs.rs/actix-trypema"
 homepage = "https://trypema.davidoyinbo.com/actix-web"
 keywords = ["rate-limiting", "actix-web", "middleware", "throttling", "actix"]
 categories = ["web-programming::http-server"]
-exclude = [".github", "compose.yaml"]
+exclude = [".github", "Makefile", "compose.yaml"]
 
 [dependencies]
 actix-web = { version = "4.15", default-features = false }

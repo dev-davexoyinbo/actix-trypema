@@ -61,6 +61,7 @@ Follow these rules:
 | `tests/allocations.rs` | The allocation guard of the admit path (section 6) |
 | `benches/overhead.rs` | The Criterion benchmark of the cost of one request |
 | `examples/` | Four runnable servers |
+| `Makefile` | `make test`, `make check` and the other local check targets (section 10) |
 | `README.md`, `CHANGELOG.md` | The crates.io and GitHub page, and the release record |
 
 The Actix Web pages of the external guide are in the `trypema-docs` repository, in
@@ -377,6 +378,17 @@ Tests are contracts. They must fail when the code breaks a contract.
 
 Run checks in proportion to the change. For a change to a request path, a backend, a feature
 gate or a dependency, run the full matrix.
+
+The `Makefile` runs the matrix:
+
+- `make test` starts the test Redis, runs `cargo test` on all 8 feature sets, and then stops
+  Redis. Redis also stops when a test fails.
+- `make lint` checks the format, runs clippy on all 8 feature sets and checks the dependency
+  tree.
+- `make doc` and `make msrv` run the commands of sections 10.1 and 10.4.
+- `make check` runs `lint`, `doc`, `msrv` and `test`.
+
+The sections below give the commands, for a single step or a single test.
 
 ### 10.1 CI checks
 
