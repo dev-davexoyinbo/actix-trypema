@@ -4,6 +4,7 @@
 mod common;
 mod support;
 
+mod backends;
 mod bypass;
 mod config;
 mod headers;

@@ -7,7 +7,7 @@ use trypema::{RateLimit, WindowSize};
 
 use crate::{
     BackendErrorPolicy, ConfigError, KeyError, KeyErrorPolicy,
-    backend::Backend,
+    backend::{Backend, ProviderBackend},
     extract::{FnExtractor, KeyExtractor},
     key::validate_namespace,
     response::{DefaultResponder, RejectionResponder, nonzero_duration},
@@ -130,7 +130,8 @@ impl<B> fmt::Debug for TrypemaLimiter<B> {
 } // end impl
 
 impl<B: Backend> TrypemaLimiter<B> {
-    /// Configure a limiter on a backend handle: [`Local`](crate::Local), `Redis`, or `Hybrid`.
+    /// Configure a limiter on a backend: an `Arc` of a trypema provider or limiter (see
+    /// [`Backend`]).
     pub fn builder(backend: B) -> TrypemaLimiterBuilder<B> {
         TrypemaLimiterBuilder {
             backend,
@@ -217,7 +218,7 @@ impl<B: Backend> TrypemaLimiterBuilder<B> {
     ///
     /// trypema rates are sticky per key: the first rate stored for a key wins. Return a rate
     /// that is a pure function of the key — for plan tiers, put the tier in the key — or change
-    /// tiers explicitly with the provider's `set_rate_limit` and
+    /// tiers explicitly with the backend's `set_rate_limit` and
     /// [`derived_key`](crate::derived_key). A rate below one request per window rejects every
     /// request for that key.
     pub fn rate_fn(
@@ -242,12 +243,6 @@ impl<B: Backend> TrypemaLimiterBuilder<B> {
         self
     }
 
-    /// Choose the admission strategy. Defaults to [`Strategy::Absolute`].
-    pub fn strategy(mut self, strategy: Strategy) -> Self {
-        self.strategy = strategy;
-        self
-    }
-
     /// Choose the response headers. Defaults to [`HeaderMode::Legacy`].
     pub fn headers(mut self, mode: HeaderMode) -> Self {
         self.header_mode = mode;
@@ -256,9 +251,9 @@ impl<B: Backend> TrypemaLimiterBuilder<B> {
 
     /// Also send the remaining quota on admitted responses.
     ///
-    /// Costs one extra provider read per request: in-memory for Local, a Redis round trip for
-    /// Redis, and a local estimate for Hybrid, which then also takes its async path instead of
-    /// deciding synchronously from local state.
+    /// Costs one extra read per request: in memory for a local backend, a Redis round trip for a
+    /// Redis backend, and a local estimate for a hybrid backend. A hybrid backend then also
+    /// takes its async path instead of deciding synchronously from local state.
     pub fn remaining_header(mut self, enabled: bool) -> Self {
         self.remaining_header = enabled;
         self
@@ -276,8 +271,8 @@ impl<B: Backend> TrypemaLimiterBuilder<B> {
     /// Requests whose key cannot be extracted bypass the limiter even under
     /// [`KeyErrorPolicy::Reject`], and backend failures are admitted whatever `on_backend_error`
     /// says. Implies [`record_outcome`](Self::record_outcome). With the Absolute strategy, rejected
-    /// calls record nothing in the limiter, so shadow counters under-count overload; use
-    /// [`Strategy::Suppressed`] for accurate shadow accounting.
+    /// calls record nothing in the limiter, so shadow counters under-count overload; use the
+    /// suppressed strategy for accurate shadow accounting.
     pub fn permissive(mut self, enabled: bool) -> Self {
         self.permissive = enabled;
         self
@@ -299,7 +294,9 @@ impl<B: Backend> TrypemaLimiterBuilder<B> {
     /// # Examples
     ///
     /// ```
-    /// # fn example(builder: actix_trypema::TrypemaLimiterBuilder<actix_trypema::Local>) {
+    /// # use std::sync::Arc;
+    /// # use actix_trypema::trypema::local::LocalRateLimiterProvider;
+    /// # fn example(builder: actix_trypema::TrypemaLimiterBuilder<Arc<LocalRateLimiterProvider>>) {
     /// use actix_web::http::Method;
     ///
     /// // Limit only POSTs, and never the health check:
@@ -388,7 +385,7 @@ impl<B: Backend> TrypemaLimiterBuilder<B> {
                 extractor,
                 rate,
                 cost: self.cost,
-                strategy: self.strategy,
+                strategy: B::STRATEGY.unwrap_or(self.strategy),
                 header_mode: self.header_mode,
                 remaining_header: self.remaining_header,
                 suppressed_retry_hint: self.suppressed_retry_hint,
@@ -404,6 +401,46 @@ impl<B: Backend> TrypemaLimiterBuilder<B> {
             }),
         })
     } // end method build
+} // end impl
+
+impl<B: ProviderBackend> TrypemaLimiterBuilder<B> {
+    /// Choose the admission strategy of a provider. Defaults to [`Strategy::Absolute`].
+    ///
+    /// A single limiter, such as `Arc<AbsoluteLocalRateLimiter>`, runs its own strategy, so its
+    /// builder has no `strategy`:
+    ///
+    /// ```compile_fail,E0599
+    /// use std::sync::Arc;
+    /// use actix_trypema::{Strategy, TrypemaLimiter};
+    /// use actix_trypema::trypema::{RateLimiterBuilder, WindowSize, local::AbsoluteLocalRateLimiter};
+    ///
+    /// let backend: Arc<AbsoluteLocalRateLimiter> = RateLimiterBuilder::local()
+    ///     .window_size(WindowSize::seconds_or_panic(60))
+    ///     .build()
+    ///     .unwrap();
+    ///
+    /// let builder = TrypemaLimiter::builder(backend).strategy(Strategy::Suppressed);
+    /// ```
+    ///
+    /// Build the suppressed limiter instead, or use a provider:
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use actix_trypema::{Strategy, TrypemaLimiter};
+    /// use actix_trypema::trypema::{RateLimiterBuilder, WindowSize, local::LocalRateLimiterProvider};
+    ///
+    /// let backend: Arc<LocalRateLimiterProvider> = RateLimiterBuilder::local()
+    ///     .window_size(WindowSize::seconds_or_panic(60))
+    ///     .build()?;
+    ///
+    /// let builder = TrypemaLimiter::builder(backend).strategy(Strategy::Suppressed);
+    /// # let _ = builder;
+    /// # Ok::<(), actix_trypema::trypema::TrypemaError>(())
+    /// ```
+    pub fn strategy(mut self, strategy: Strategy) -> Self {
+        self.strategy = strategy;
+        self
+    }
 } // end impl
 
 #[cfg(feature = "redis")]

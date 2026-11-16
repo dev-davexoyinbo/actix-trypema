@@ -4,15 +4,23 @@
 //! `for i in $(seq 6); do curl -s -o /dev/null -w '%{http_code}\n' localhost:8080/; done`
 //! The first five print `200` and the sixth `429`. `/healthz` is never limited.
 
-use actix_trypema::{Local, TrypemaLimiter, extract::PeerIp};
+use std::sync::Arc;
+
+use actix_trypema::{
+    TrypemaLimiter,
+    extract::PeerIp,
+    trypema::{RateLimit, RateLimiterBuilder, WindowSize, local::AbsoluteLocalRateLimiter},
+};
 use actix_web::{App, HttpServer, web};
-use trypema::{RateLimit, WindowSize};
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     // Build the backend ONCE, outside HttpServer::new. Inside the closure every worker would
     // get its own limiter, multiplying the effective limit by the worker count.
-    let backend = Local::new(WindowSize::seconds_or_panic(60)).expect("valid backend");
+    let backend: Arc<AbsoluteLocalRateLimiter> = RateLimiterBuilder::local()
+        .window_size(WindowSize::seconds_or_panic(60))
+        .build()
+        .expect("valid backend");
 
     let limiter = TrypemaLimiter::builder(backend)
         .namespace("ip")

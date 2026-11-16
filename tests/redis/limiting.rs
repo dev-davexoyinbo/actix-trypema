@@ -4,8 +4,8 @@ use actix_trypema::derived_key;
 use actix_web::{App, http::StatusCode, test, web};
 
 use crate::{
-    common::{CLIENT, CLIENT_KEY, WINDOW_SECS, get, header, per_ip, status_or_error},
-    support::{redis_backend, redis_url, unique_prefix},
+    common::{CLIENT, CLIENT_KEY, WINDOW_SECS, get, header, status_or_error},
+    support::{per_ip, redis_backend, redis_url, unique_prefix},
 };
 
 #[actix_web::test]
@@ -46,13 +46,14 @@ async fn instances_share_one_limit_and_persist_derived_keys() {
     let retry_after: u64 = header(&rejected, "retry-after").unwrap().parse().unwrap();
     assert!((1..=WINDOW_SECS).contains(&retry_after), "{retry_after}");
 
-    // The persisted keys embed the documented derived-key encoding.
+    // The persisted keys embed the documented derived-key encoding. trypema writes
+    // `{prefix}:{key}:...`; the colon keeps out the keys of a prefix that this one begins.
     let mut sync_connection = redis::Client::open(url.as_str())
         .unwrap()
         .get_connection()
         .unwrap();
     let keys: Vec<String> = redis::cmd("KEYS")
-        .arg(format!("{prefix}*"))
+        .arg(format!("{prefix}:*"))
         .query(&mut sync_connection)
         .unwrap();
 

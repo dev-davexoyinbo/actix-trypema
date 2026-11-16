@@ -13,8 +13,10 @@ use std::{
     net::SocketAddr,
 };
 
+use std::sync::Arc;
+
 use actix_trypema::{
-    HeaderMode, Local, TrypemaLimiter,
+    HeaderMode, TrypemaLimiter,
     extract::{Header, KeyExtractor, PeerIp, RealIp, TrustedProxies},
 };
 use actix_web::{
@@ -22,7 +24,7 @@ use actix_web::{
     dev::{Service, ServiceRequest, Transform, fn_service},
     test::TestRequest,
 };
-use trypema::{RateLimit, WindowSize};
+use trypema::{RateLimit, RateLimiterBuilder, WindowSize, local::LocalRateLimiterProvider};
 
 /// Counts allocations made on the current thread while counting is switched on.
 struct CountingAllocator;
@@ -71,7 +73,12 @@ async fn middleware_for(
     extractor: impl KeyExtractor,
     allow_keys: &[&str],
 ) -> impl Service<ServiceRequest, Error = actix_web::Error> {
-    let limiter = TrypemaLimiter::builder(Local::new(WindowSize::seconds_or_panic(60)).unwrap())
+    let backend: Arc<LocalRateLimiterProvider> = RateLimiterBuilder::local()
+        .window_size(WindowSize::seconds_or_panic(60))
+        .build()
+        .unwrap();
+
+    let limiter = TrypemaLimiter::builder(backend)
         .namespace("alloc")
         .extractor(extractor)
         .rate(RateLimit::per_second_or_panic(1e9))
@@ -160,30 +167,41 @@ async fn header_keys_do_not_allocate() {
 #[cfg(feature = "redis")]
 #[actix_web::test]
 async fn hybrid_admit_path_does_not_allocate() {
-    use actix_trypema::Hybrid;
-    use trypema::{RateLimiterBuilder, redis::RedisKey};
+    use std::time::Duration;
 
+    use redis::aio::ConnectionManagerConfig;
+    use trypema::{hybrid::HybridRateLimiterProvider, redis::RedisKey};
+
+    // The warm-up requests must reach Redis: one that times out fails open, leaves the key
+    // unknown to local state, and sends the measured request down the allocating Redis path.
+    // Wide redis-rs and middleware timeouts keep a loaded machine from causing that.
     let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:16379/".to_string());
+    let config = ConnectionManagerConfig::new()
+        .set_response_timeout(Some(Duration::from_secs(30)))
+        .set_connection_timeout(Some(Duration::from_secs(30)));
     let connection = redis::Client::open(url)
         .unwrap()
-        .get_connection_manager()
+        .get_connection_manager_with_config(config)
         .await
         .unwrap();
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .subsec_nanos();
+        .as_nanos();
     let prefix = RedisKey::try_from(format!("at-alloc-{}-{nanos}", std::process::id())).unwrap();
-    let backend = Hybrid::configured(connection, WindowSize::seconds_or_panic(60), |builder| {
-        builder.prefix(prefix).disable_cleanup()
-    })
-    .unwrap();
+    let backend: Arc<HybridRateLimiterProvider> = RateLimiterBuilder::hybrid(connection)
+        .prefix(prefix)
+        .window_size(WindowSize::seconds_or_panic(60))
+        .disable_cleanup()
+        .build()
+        .unwrap();
 
     let limiter = TrypemaLimiter::builder(backend)
         .namespace("alloc")
         .extractor(PeerIp::default())
         .rate(RateLimit::per_second_or_panic(1e9))
         .headers(HeaderMode::Off)
+        .backend_timeout(Duration::from_secs(10))
         .build()
         .unwrap();
     let middleware = limiter

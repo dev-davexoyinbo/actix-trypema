@@ -5,6 +5,64 @@ This file records all notable changes to `actix-trypema`.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). This crate uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-11-15
+
+### Changed
+
+- actix-trypema 0.2 needs trypema 3.1. It does not build with trypema 2 or 3.0. trypema 3.1
+  gives the window of each provider and limiter with `window_size()`.
+- The backend is trypema's own provider or limiter, in an `Arc`. You build it with trypema's
+  `RateLimiterBuilder` and give it to `TrypemaLimiter::builder`. The middleware reads the window
+  from the backend. `TrypemaLimiter::builder` takes `Arc<T>` for these nine types:
+  - No feature: `LocalRateLimiterProvider`, `AbsoluteLocalRateLimiter`,
+    `SuppressedLocalRateLimiter`.
+  - `redis` feature: `RedisRateLimiterProvider`, `AbsoluteRedisRateLimiter`,
+    `SuppressedRedisRateLimiter`, `HybridRateLimiterProvider`, `AbsoluteHybridRateLimiter`,
+    `SuppressedHybridRateLimiter`.
+- A provider holds both strategies, and `strategy(..)` selects one. A single limiter holds one
+  strategy, and its type sets the strategy: the builder of a single-limiter backend has no
+  `strategy(..)`. The metrics `strategy` label and `RejectionInfo::strategy` show the strategy
+  of the limiter.
+- `on_backend_error(..)` and `backend_timeout(..)` exist only on the Redis and hybrid backends,
+  as in 0.1.
+- `BackendErrorPolicy::Fallback` holds an `Arc<LocalRateLimiterProvider>`. A provider holds both
+  strategies, so it serves an absolute and a suppressed primary. Its window must be the window of
+  the primary, or `build()` returns `ConfigError::FallbackWindowMismatch`.
+- `Backend` is implemented for the nine `Arc` types above. `ProviderBackend` marks the three
+  providers.
+- Redis key names do not change. A single limiter and a provider with the same prefix use the
+  same Redis keys, so they share counts.
+
+### Removed
+
+- The types `Local`, `Redis` and `Hybrid`, with their `new`, `configured` and `provider()`.
+  Write this instead:
+
+  | 0.1 | 0.2 |
+  |---|---|
+  | `Local::new(window)?` | `RateLimiterBuilder::local().window_size(window).build()?` |
+  | `Redis::new(connection, window)?` | `RateLimiterBuilder::redis(connection).window_size(window).build()?` |
+  | `Hybrid::new(connection, window)?` | `RateLimiterBuilder::hybrid(connection).window_size(window).build()?` |
+  | `Hybrid::configured(connection, window, \|b\| b.prefix(p))?` | `RateLimiterBuilder::hybrid(connection).prefix(p).window_size(window).build()?` |
+  | `backend.provider().absolute().get(&key)` | `backend.absolute().get(&key)` on a provider, `backend.get(&key)` on a limiter |
+  | `BackendErrorPolicy::Fallback(local)` with `local: Local` | `BackendErrorPolicy::Fallback(local)` with `local: Arc<LocalRateLimiterProvider>` |
+
+  Annotate the result of `build()` with the type: `Arc<LocalRateLimiterProvider>` for both
+  strategies, or one limiter type such as `Arc<AbsoluteHybridRateLimiter>`.
+
+### Added
+
+- `pub use trypema;`: `actix_trypema::trypema` is the trypema version that this crate uses. A
+  separate `trypema` dependency is optional. If you add one, it must be the same version.
+- Single-limiter backends: the six trypema limiter types above. A single limiter does not create
+  the state of the other strategy.
+- `ProviderBackend`: the sealed trait of the three provider backends.
+- `Backend::STRATEGY`: the strategy of a single limiter, or `None` for a provider.
+
+### Requirements
+
+- trypema 3.1 or later.
+
 ## [0.1.1] - 2026-10-05
 
 ### Changed

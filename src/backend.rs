@@ -1,104 +1,151 @@
-//! Backend handles: a trypema provider plus the window it was built with.
+//! Backends: trypema's own providers and limiters, shared through an `Arc`.
 //!
-//! The middleware needs the provider's window to advertise limits, and trypema does not expose
-//! it. The handles therefore build the provider themselves and apply the window last, so the
-//! advertised limit can never disagree with what the provider enforces.
+//! A provider holds both strategies, so the builder chooses one with `strategy(..)`. A single
+//! limiter holds one strategy, so its type sets the strategy.
 
-use std::{fmt, sync::Arc};
+use std::sync::Arc;
 
 use trypema::{
-    RateLimit, RateLimitDecision, RateLimiterBuilder, TrypemaError, WindowSize,
-    local::{LocalRateLimiterBuilder, LocalRateLimiterProvider},
+    RateLimit, RateLimitDecision, WindowSize,
+    local::{AbsoluteLocalRateLimiter, LocalRateLimiterProvider, SuppressedLocalRateLimiter},
 };
 
 use crate::builder::Strategy;
 
 #[cfg(feature = "redis")]
 use trypema::{
-    hybrid::{HybridRateLimiterBuilder, HybridRateLimiterProvider},
+    TrypemaError,
+    hybrid::{AbsoluteHybridRateLimiter, HybridRateLimiterProvider, SuppressedHybridRateLimiter},
     redis::{
-        ConnectionManager, RedisKey, RedisKeyRef, RedisRateLimiterBuilder, RedisRateLimiterProvider,
+        AbsoluteRedisRateLimiter, RedisKey, RedisKeyRef, RedisRateLimiterProvider,
+        SuppressedRedisRateLimiter,
     },
 };
 
-mod sealed {
+pub(crate) mod sealed {
     pub trait Sealed {}
+
+    /// The kind of a backend that decides synchronously: the local types.
+    pub enum SyncKind {}
+
+    /// The kind of a backend that awaits Redis: the Redis and hybrid types.
+    #[cfg(feature = "redis")]
+    pub enum AsyncKind {}
 }
 
-/// A trypema backend the middleware can drive: [`Local`], `Redis`, or `Hybrid`.
+use sealed::{Sealed, SyncKind};
+
+#[cfg(feature = "redis")]
+use sealed::AsyncKind;
+
+/// A trypema provider or limiter the middleware can drive, in an `Arc`.
 ///
-/// Sealed; construct one of the handles instead of implementing it.
-pub trait Backend: sealed::Sealed + Clone + 'static {
-    /// The window the provider was built with.
+/// Sealed. It is implemented for `Arc<T>`, where `T` is one of these trypema types:
+///
+/// | Feature | Providers (both strategies) | Single limiters (one strategy) |
+/// |---|---|---|
+/// | none | [`LocalRateLimiterProvider`] | [`AbsoluteLocalRateLimiter`], [`SuppressedLocalRateLimiter`] |
+/// | `redis` | `RedisRateLimiterProvider`, `HybridRateLimiterProvider` | `AbsoluteRedisRateLimiter`, `SuppressedRedisRateLimiter`, `AbsoluteHybridRateLimiter`, `SuppressedHybridRateLimiter` |
+///
+/// Build the value with trypema's `RateLimiterBuilder`. The middleware reads the window from
+/// the value, so the advertised limit always agrees with the enforced limit.
+pub trait Backend: Sealed + Clone + 'static {
+    /// Selects the synchronous or the asynchronous request path.
+    #[doc(hidden)]
+    type Kind;
+
+    /// The strategy of a single limiter. `None` for a provider: the builder then uses the
+    /// strategy given to [`strategy`](crate::TrypemaLimiterBuilder::strategy).
+    const STRATEGY: Option<Strategy>;
+
+    /// The window the provider or limiter was built with.
     fn window_size(&self) -> WindowSize;
 }
 
-/// The in-process backend.
+/// A backend that holds both strategies: a trypema provider.
 ///
-/// Cloning is cheap and shares one provider, so build it once — outside `HttpServer::new`, or
-/// every worker gets its own limiter — and clone it into each middleware instance.
-///
-/// # Examples
-///
-/// ```
-/// use actix_trypema::Local;
-/// use trypema::{BucketSize, RateLimiterBuilder, WindowSize};
-///
-/// let backend = Local::new(WindowSize::seconds_or_panic(60))?;
-///
-/// // Any other provider option goes through trypema's builder:
-/// let tuned = Local::configured(WindowSize::seconds_or_panic(60), |builder| {
-///     builder.bucket_size(BucketSize::milliseconds_or_panic(10))
-/// })?;
-/// # let _ = (backend, tuned);
-/// # Ok::<(), trypema::TrypemaError>(())
-/// ```
-#[derive(Clone)]
-pub struct Local {
-    provider: Arc<LocalRateLimiterProvider>,
-    window_size: WindowSize,
+/// Only these backends accept [`strategy`](crate::TrypemaLimiterBuilder::strategy). Sealed.
+pub trait ProviderBackend: Backend {}
+
+macro_rules! backend {
+    ($target:ty, $kind:ty, $strategy:expr) => {
+        impl Sealed for Arc<$target> {}
+
+        impl Backend for Arc<$target> {
+            type Kind = $kind;
+
+            const STRATEGY: Option<Strategy> = $strategy;
+
+            fn window_size(&self) -> WindowSize {
+                <$target>::window_size(self)
+            }
+        } // end impl
+    };
 }
 
-impl Local {
-    /// Build an in-process provider with this window and trypema's defaults otherwise.
-    ///
-    /// # Errors
-    ///
-    /// Returns the [`TrypemaError`] trypema's builder reports for an invalid configuration.
-    pub fn new(window_size: WindowSize) -> Result<Self, TrypemaError> {
-        Self::configured(window_size, |builder| builder)
-    }
+backend!(LocalRateLimiterProvider, SyncKind, None);
+backend!(AbsoluteLocalRateLimiter, SyncKind, Some(Strategy::Absolute));
+backend!(
+    SuppressedLocalRateLimiter,
+    SyncKind,
+    Some(Strategy::Suppressed)
+);
 
-    /// Build an in-process provider, customizing any option except the window.
-    ///
-    /// `configure` receives trypema's builder. The window is applied after it, so the provider
-    /// always enforces the window the middleware advertises.
-    ///
-    /// # Errors
-    ///
-    /// Returns the [`TrypemaError`] trypema's builder reports for an invalid configuration, for
-    /// example a bucket size larger than the window.
-    pub fn configured(
-        window_size: WindowSize,
-        configure: impl FnOnce(LocalRateLimiterBuilder) -> LocalRateLimiterBuilder,
-    ) -> Result<Self, TrypemaError> {
-        let provider = configure(LocalRateLimiterProvider::builder())
-            .window_size(window_size)
-            .build()?;
+#[cfg(feature = "redis")]
+backend!(RedisRateLimiterProvider, AsyncKind, None);
+#[cfg(feature = "redis")]
+backend!(
+    AbsoluteRedisRateLimiter,
+    AsyncKind,
+    Some(Strategy::Absolute)
+);
+#[cfg(feature = "redis")]
+backend!(
+    SuppressedRedisRateLimiter,
+    AsyncKind,
+    Some(Strategy::Suppressed)
+);
+#[cfg(feature = "redis")]
+backend!(HybridRateLimiterProvider, AsyncKind, None);
+#[cfg(feature = "redis")]
+backend!(
+    AbsoluteHybridRateLimiter,
+    AsyncKind,
+    Some(Strategy::Absolute)
+);
+#[cfg(feature = "redis")]
+backend!(
+    SuppressedHybridRateLimiter,
+    AsyncKind,
+    Some(Strategy::Suppressed)
+);
 
-        Ok(Self {
-            provider,
-            window_size,
-        })
-    } // end constructor
+impl ProviderBackend for Arc<LocalRateLimiterProvider> {}
 
-    /// The provider, for administration such as `delete` or `set_rate_limit` with
-    /// [`derived_key`](crate::derived_key).
-    pub fn provider(&self) -> &Arc<LocalRateLimiterProvider> {
-        &self.provider
-    }
+#[cfg(feature = "redis")]
+impl ProviderBackend for Arc<RedisRateLimiterProvider> {}
 
-    pub(crate) fn inc(
+#[cfg(feature = "redis")]
+impl ProviderBackend for Arc<HybridRateLimiterProvider> {}
+
+/// The local backends: decided synchronously, in process.
+///
+/// A single limiter ignores `strategy`: it always runs its own strategy.
+pub(crate) trait SyncBackend: Backend {
+    fn backend_inc(
+        &self,
+        strategy: Strategy,
+        key: &str,
+        rate: &RateLimit,
+        cost: u64,
+    ) -> RateLimitDecision;
+
+    /// Live `(total, declined)` usage for `key`.
+    fn backend_usage(&self, strategy: Strategy, key: &str) -> (u64, u64);
+}
+
+impl SyncBackend for Arc<LocalRateLimiterProvider> {
+    fn backend_inc(
         &self,
         strategy: Strategy,
         key: &str,
@@ -106,43 +153,63 @@ impl Local {
         cost: u64,
     ) -> RateLimitDecision {
         match strategy {
-            Strategy::Absolute => self.provider.absolute().inc(key, rate, cost),
-            Strategy::Suppressed => self.provider.suppressed().inc(key, rate, cost),
+            Strategy::Absolute => self.absolute().inc(key, rate, cost),
+            Strategy::Suppressed => self.suppressed().inc(key, rate, cost),
         }
     }
 
-    /// Live `(total, declined)` usage for `key`.
-    pub(crate) fn usage(&self, strategy: Strategy, key: &str) -> (u64, u64) {
+    fn backend_usage(&self, strategy: Strategy, key: &str) -> (u64, u64) {
         match strategy {
-            Strategy::Absolute => (self.provider.absolute().get(key), 0),
+            Strategy::Absolute => (self.absolute().get(key), 0),
             Strategy::Suppressed => {
-                let snapshot = self.provider.suppressed().get(key);
+                let snapshot = self.suppressed().get(key);
                 (snapshot.total, snapshot.total_declined)
             }
         }
     }
 } // end impl
 
-impl sealed::Sealed for Local {}
+impl SyncBackend for Arc<AbsoluteLocalRateLimiter> {
+    fn backend_inc(
+        &self,
+        _strategy: Strategy,
+        key: &str,
+        rate: &RateLimit,
+        cost: u64,
+    ) -> RateLimitDecision {
+        AbsoluteLocalRateLimiter::inc(self, key, rate, cost)
+    }
 
-impl Backend for Local {
-    fn window_size(&self) -> WindowSize {
-        self.window_size
+    fn backend_usage(&self, _strategy: Strategy, key: &str) -> (u64, u64) {
+        (AbsoluteLocalRateLimiter::get(self, key), 0)
     }
 } // end impl
 
-impl fmt::Debug for Local {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("Local")
-            .field("window_size", &self.window_size)
-            .finish_non_exhaustive()
+impl SyncBackend for Arc<SuppressedLocalRateLimiter> {
+    fn backend_inc(
+        &self,
+        _strategy: Strategy,
+        key: &str,
+        rate: &RateLimit,
+        cost: u64,
+    ) -> RateLimitDecision {
+        SuppressedLocalRateLimiter::inc(self, key, rate, cost)
+    }
+
+    fn backend_usage(&self, _strategy: Strategy, key: &str) -> (u64, u64) {
+        let snapshot = SuppressedLocalRateLimiter::get(self, key);
+        (snapshot.total, snapshot.total_declined)
     }
 } // end impl
 
-/// Async backends: `Redis` and `Hybrid`. Sealed.
+/// The Redis and hybrid backends: decided through Redis, under a timeout. Sealed.
+///
+/// Only these backends accept
+/// [`on_backend_error`](crate::TrypemaLimiterBuilder::on_backend_error) and
+/// [`backend_timeout`](crate::TrypemaLimiterBuilder::backend_timeout).
 #[cfg(feature = "redis")]
 pub trait AsyncBackend: Backend {
+    /// Count `cost` for `key`. A single limiter ignores `strategy`.
     #[doc(hidden)]
     fn backend_inc(
         &self,
@@ -163,7 +230,8 @@ pub trait AsyncBackend: Backend {
         Ok(None)
     }
 
-    /// Live `(total, declined)` usage for `key`.
+    /// `(total, declined)` usage for `key`: read from Redis, or the local estimate of a hybrid
+    /// backend.
     #[doc(hidden)]
     fn backend_usage(
         &self,
@@ -172,83 +240,8 @@ pub trait AsyncBackend: Backend {
     ) -> impl Future<Output = Result<(u64, u64), TrypemaError>>;
 }
 
-/// The distributed Redis backend, shared across every app instance on the same prefix.
-///
-/// Cloning is cheap and shares one provider.
-///
-/// # Examples
-///
-/// ```no_run
-/// # async fn example(connection: trypema::redis::ConnectionManager) -> Result<(), trypema::TrypemaError> {
-/// use actix_trypema::Redis;
-/// use trypema::{RateLimiterBuilder, WindowSize, redis::RedisKey};
-///
-/// let backend = Redis::configured(connection, WindowSize::seconds_or_panic(60), |builder| {
-///     builder.prefix(RedisKey::try_from("my-service").unwrap())
-/// })?;
-/// # let _ = backend;
-/// # Ok(())
-/// # }
-/// ```
 #[cfg(feature = "redis")]
-#[derive(Clone)]
-pub struct Redis {
-    provider: Arc<RedisRateLimiterProvider>,
-    window_size: WindowSize,
-}
-
-#[cfg(feature = "redis")]
-impl Redis {
-    /// Build a Redis provider with this window and trypema's defaults otherwise.
-    ///
-    /// # Errors
-    ///
-    /// Returns the [`TrypemaError`] trypema's builder reports for an invalid configuration.
-    pub fn new(
-        connection: ConnectionManager,
-        window_size: WindowSize,
-    ) -> Result<Self, TrypemaError> {
-        Self::configured(connection, window_size, |builder| builder)
-    }
-
-    /// Build a Redis provider, customizing any option except the window.
-    ///
-    /// # Errors
-    ///
-    /// Returns the [`TrypemaError`] trypema's builder reports for an invalid configuration.
-    pub fn configured(
-        connection: ConnectionManager,
-        window_size: WindowSize,
-        configure: impl FnOnce(RedisRateLimiterBuilder) -> RedisRateLimiterBuilder,
-    ) -> Result<Self, TrypemaError> {
-        let provider = configure(RedisRateLimiterProvider::builder(connection))
-            .window_size(window_size)
-            .build()?;
-
-        Ok(Self {
-            provider,
-            window_size,
-        })
-    } // end constructor
-
-    /// The provider, for administration with [`derived_key`](crate::derived_key).
-    pub fn provider(&self) -> &Arc<RedisRateLimiterProvider> {
-        &self.provider
-    }
-} // end impl
-
-#[cfg(feature = "redis")]
-impl sealed::Sealed for Redis {}
-
-#[cfg(feature = "redis")]
-impl Backend for Redis {
-    fn window_size(&self) -> WindowSize {
-        self.window_size
-    }
-} // end impl
-
-#[cfg(feature = "redis")]
-impl AsyncBackend for Redis {
+impl AsyncBackend for Arc<RedisRateLimiterProvider> {
     async fn backend_inc(
         &self,
         strategy: Strategy,
@@ -257,8 +250,8 @@ impl AsyncBackend for Redis {
         cost: u64,
     ) -> Result<RateLimitDecision, TrypemaError> {
         match strategy {
-            Strategy::Absolute => self.provider.absolute().inc(key, rate, cost).await,
-            Strategy::Suppressed => self.provider.suppressed().inc(key, rate, cost).await,
+            Strategy::Absolute => self.absolute().inc(key, rate, cost).await,
+            Strategy::Suppressed => self.suppressed().inc(key, rate, cost).await,
         }
     }
 
@@ -268,9 +261,9 @@ impl AsyncBackend for Redis {
         key: &RedisKey,
     ) -> Result<(u64, u64), TrypemaError> {
         match strategy {
-            Strategy::Absolute => Ok((self.provider.absolute().get(key).await?, 0)),
+            Strategy::Absolute => Ok((self.absolute().get(key).await?, 0)),
             Strategy::Suppressed => {
-                let snapshot = self.provider.suppressed().get(key).await?;
+                let snapshot = self.suppressed().get(key).await?;
                 Ok((snapshot.total, snapshot.total_declined))
             }
         }
@@ -278,79 +271,52 @@ impl AsyncBackend for Redis {
 } // end impl
 
 #[cfg(feature = "redis")]
-impl fmt::Debug for Redis {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("Redis")
-            .field("window_size", &self.window_size)
-            .finish_non_exhaustive()
-    }
-} // end impl
-
-/// The hybrid backend: a local fast path with periodic Redis sync.
-///
-/// Admission lags Redis by the sync interval, and batches not yet flushed can be lost when the
-/// provider is dropped at shutdown. Cloning is cheap and shares one provider.
-#[cfg(feature = "redis")]
-#[derive(Clone)]
-pub struct Hybrid {
-    provider: Arc<HybridRateLimiterProvider>,
-    window_size: WindowSize,
-}
-
-#[cfg(feature = "redis")]
-impl Hybrid {
-    /// Build a hybrid provider with this window and trypema's defaults otherwise.
-    ///
-    /// # Errors
-    ///
-    /// Returns the [`TrypemaError`] trypema's builder reports for an invalid configuration.
-    pub fn new(
-        connection: ConnectionManager,
-        window_size: WindowSize,
-    ) -> Result<Self, TrypemaError> {
-        Self::configured(connection, window_size, |builder| builder)
+impl AsyncBackend for Arc<AbsoluteRedisRateLimiter> {
+    async fn backend_inc(
+        &self,
+        _strategy: Strategy,
+        key: &RedisKey,
+        rate: &RateLimit,
+        cost: u64,
+    ) -> Result<RateLimitDecision, TrypemaError> {
+        AbsoluteRedisRateLimiter::inc(self, key, rate, cost).await
     }
 
-    /// Build a hybrid provider, customizing any option (such as `sync_interval`) except the
-    /// window.
-    ///
-    /// # Errors
-    ///
-    /// Returns the [`TrypemaError`] trypema's builder reports for an invalid configuration.
-    pub fn configured(
-        connection: ConnectionManager,
-        window_size: WindowSize,
-        configure: impl FnOnce(HybridRateLimiterBuilder) -> HybridRateLimiterBuilder,
-    ) -> Result<Self, TrypemaError> {
-        let provider = configure(HybridRateLimiterProvider::builder(connection))
-            .window_size(window_size)
-            .build()?;
-
-        Ok(Self {
-            provider,
-            window_size,
-        })
-    } // end constructor
-
-    /// The provider, for administration with [`derived_key`](crate::derived_key).
-    pub fn provider(&self) -> &Arc<HybridRateLimiterProvider> {
-        &self.provider
+    async fn backend_usage(
+        &self,
+        _strategy: Strategy,
+        key: &RedisKey,
+    ) -> Result<(u64, u64), TrypemaError> {
+        Ok((AbsoluteRedisRateLimiter::get(self, key).await?, 0))
     }
 } // end impl
 
 #[cfg(feature = "redis")]
-impl sealed::Sealed for Hybrid {}
+impl AsyncBackend for Arc<SuppressedRedisRateLimiter> {
+    async fn backend_inc(
+        &self,
+        _strategy: Strategy,
+        key: &RedisKey,
+        rate: &RateLimit,
+        cost: u64,
+    ) -> Result<RateLimitDecision, TrypemaError> {
+        SuppressedRedisRateLimiter::inc(self, key, rate, cost).await
+    }
 
-#[cfg(feature = "redis")]
-impl Backend for Hybrid {
-    fn window_size(&self) -> WindowSize {
-        self.window_size
+    async fn backend_usage(
+        &self,
+        _strategy: Strategy,
+        key: &RedisKey,
+    ) -> Result<(u64, u64), TrypemaError> {
+        let snapshot = SuppressedRedisRateLimiter::get(self, key).await?;
+        Ok((snapshot.total, snapshot.total_declined))
     }
 } // end impl
 
+// The hybrid usage reads use get_estimate, which keeps them off Redis in steady state.
+
 #[cfg(feature = "redis")]
-impl AsyncBackend for Hybrid {
+impl AsyncBackend for Arc<HybridRateLimiterProvider> {
     async fn backend_inc(
         &self,
         strategy: Strategy,
@@ -359,8 +325,8 @@ impl AsyncBackend for Hybrid {
         cost: u64,
     ) -> Result<RateLimitDecision, TrypemaError> {
         match strategy {
-            Strategy::Absolute => self.provider.absolute().inc(key, rate, cost).await,
-            Strategy::Suppressed => self.provider.suppressed().inc(key, rate, cost).await,
+            Strategy::Absolute => self.absolute().inc(key, rate, cost).await,
+            Strategy::Suppressed => self.suppressed().inc(key, rate, cost).await,
         }
     }
 
@@ -371,8 +337,8 @@ impl AsyncBackend for Hybrid {
         cost: u64,
     ) -> Result<Option<RateLimitDecision>, TrypemaError> {
         match strategy {
-            Strategy::Absolute => self.provider.absolute().try_inc(key, cost),
-            Strategy::Suppressed => self.provider.suppressed().try_inc(key, cost),
+            Strategy::Absolute => self.absolute().try_inc(key, cost),
+            Strategy::Suppressed => self.suppressed().try_inc(key, cost),
         }
     }
 
@@ -381,11 +347,10 @@ impl AsyncBackend for Hybrid {
         strategy: Strategy,
         key: &RedisKey,
     ) -> Result<(u64, u64), TrypemaError> {
-        // get_estimate keeps this off the Redis hot path in steady state.
         match strategy {
-            Strategy::Absolute => Ok((self.provider.absolute().get_estimate(key).await?, 0)),
+            Strategy::Absolute => Ok((self.absolute().get_estimate(key).await?, 0)),
             Strategy::Suppressed => {
-                let snapshot = self.provider.suppressed().get_estimate(key).await?;
+                let snapshot = self.suppressed().get_estimate(key).await?;
                 Ok((snapshot.total, snapshot.total_declined))
             }
         }
@@ -393,11 +358,62 @@ impl AsyncBackend for Hybrid {
 } // end impl
 
 #[cfg(feature = "redis")]
-impl fmt::Debug for Hybrid {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("Hybrid")
-            .field("window_size", &self.window_size)
-            .finish_non_exhaustive()
+impl AsyncBackend for Arc<AbsoluteHybridRateLimiter> {
+    async fn backend_inc(
+        &self,
+        _strategy: Strategy,
+        key: &RedisKey,
+        rate: &RateLimit,
+        cost: u64,
+    ) -> Result<RateLimitDecision, TrypemaError> {
+        AbsoluteHybridRateLimiter::inc(self, key, rate, cost).await
+    }
+
+    fn try_backend_inc(
+        &self,
+        _strategy: Strategy,
+        key: RedisKeyRef<'_>,
+        cost: u64,
+    ) -> Result<Option<RateLimitDecision>, TrypemaError> {
+        AbsoluteHybridRateLimiter::try_inc(self, key, cost)
+    }
+
+    async fn backend_usage(
+        &self,
+        _strategy: Strategy,
+        key: &RedisKey,
+    ) -> Result<(u64, u64), TrypemaError> {
+        Ok((AbsoluteHybridRateLimiter::get_estimate(self, key).await?, 0))
+    }
+} // end impl
+
+#[cfg(feature = "redis")]
+impl AsyncBackend for Arc<SuppressedHybridRateLimiter> {
+    async fn backend_inc(
+        &self,
+        _strategy: Strategy,
+        key: &RedisKey,
+        rate: &RateLimit,
+        cost: u64,
+    ) -> Result<RateLimitDecision, TrypemaError> {
+        SuppressedHybridRateLimiter::inc(self, key, rate, cost).await
+    }
+
+    fn try_backend_inc(
+        &self,
+        _strategy: Strategy,
+        key: RedisKeyRef<'_>,
+        cost: u64,
+    ) -> Result<Option<RateLimitDecision>, TrypemaError> {
+        SuppressedHybridRateLimiter::try_inc(self, key, cost)
+    }
+
+    async fn backend_usage(
+        &self,
+        _strategy: Strategy,
+        key: &RedisKey,
+    ) -> Result<(u64, u64), TrypemaError> {
+        let snapshot = SuppressedHybridRateLimiter::get_estimate(self, key).await?;
+        Ok((snapshot.total, snapshot.total_declined))
     }
 } // end impl

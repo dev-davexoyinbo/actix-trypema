@@ -1,9 +1,13 @@
 //! actix-web middleware for the [trypema](https://docs.rs/trypema) sliding-window rate limiter.
 //!
-//! One middleware covers every trypema backend: [`Local`] (in-process), `Redis` (exact limits
-//! shared across instances) and `Hybrid` (shared through a local fast path), with either
-//! strategy (absolute allow/reject or probabilistic suppression). Keys, rates, request costs,
-//! headers, rejection responses and backend failure handling are set per middleware instance.
+//! One middleware covers every trypema backend: local (in process), Redis (exact limits shared
+//! across instances) and hybrid (shared through a local fast path), with either strategy
+//! (absolute allow/reject or probabilistic suppression). The backend is trypema's own provider
+//! or limiter, in an `Arc`. Keys, rates, request costs, headers, rejection responses and backend
+//! failure handling are set per middleware instance.
+//!
+//! This version needs trypema 3.1. It re-exports [`trypema`], so
+//! `actix_trypema::trypema::RateLimiterBuilder` is the trypema version this crate uses.
 //!
 //! The [actix-web guide](https://trypema.davidoyinbo.com/actix-web) covers every option with
 //! examples.
@@ -11,14 +15,18 @@
 //! # Quick start
 //!
 //! ```
-//! use actix_trypema::{Local, TrypemaLimiter, extract::PeerIp};
+//! use std::sync::Arc;
+//!
+//! use actix_trypema::{TrypemaLimiter, extract::PeerIp};
+//! use actix_trypema::trypema::{RateLimit, RateLimiterBuilder, WindowSize, local::AbsoluteLocalRateLimiter};
 //! use actix_web::{App, web};
-//! use trypema::{RateLimit, WindowSize};
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! // Build the backend ONCE, outside HttpServer::new: inside the server closure every worker
 //! // would get its own limiter, multiplying the effective limit by the worker count.
-//! let backend = Local::new(WindowSize::seconds_or_panic(60))?;
+//! let backend: Arc<AbsoluteLocalRateLimiter> = RateLimiterBuilder::local()
+//!     .window_size(WindowSize::seconds_or_panic(60))
+//!     .build()?;
 //!
 //! let limiter = TrypemaLimiter::builder(backend)
 //!     .namespace("ip")
@@ -41,15 +49,114 @@
 //!
 //! # Backends
 //!
-//! | Backend | Feature | Shared across instances |
-//! |---|---|---|
-//! | [`Local`] | none | No: each process counts on its own. |
-//! | `Redis` | `redis` | Yes, exactly; one Redis round trip per request. |
-//! | `Hybrid` | `redis` | Yes, eventually; most requests are decided from local state. |
+//! A backend is an `Arc` of a trypema provider or of one trypema limiter. Build it with
+//! trypema's `RateLimiterBuilder`: `local()`, `redis(connection)` or `hybrid(connection)`, then
+//! the window and other settings, then `build()` with the type you want.
+//!
+//! | Backend | Feature | Provider (both strategies) | Single limiters | Shared across instances |
+//! |---|---|---|---|---|
+//! | Local | none | `LocalRateLimiterProvider` | `AbsoluteLocalRateLimiter`, `SuppressedLocalRateLimiter` | No: each process counts on its own. |
+//! | Redis | `redis` | `RedisRateLimiterProvider` | `AbsoluteRedisRateLimiter`, `SuppressedRedisRateLimiter` | Yes, exactly; one Redis round trip per request. |
+//! | Hybrid | `redis` | `HybridRateLimiterProvider` | `AbsoluteHybridRateLimiter`, `SuppressedHybridRateLimiter` | Yes, eventually; most requests are decided from local state. |
+//!
+//! With a provider, [`strategy`](TrypemaLimiterBuilder::strategy) chooses the strategy (absolute
+//! by default). A single limiter runs its own strategy, and its builder has no `strategy`. A
+//! limiter and a provider with the same Redis prefix share their counts.
 //!
 //! Redis and hybrid calls are bounded by `backend_timeout`, and failures follow
-//! [`BackendErrorPolicy`]: fail open (the default), fail closed, fall back to a [`Local`]
-//! backend, or decide per failure.
+//! [`BackendErrorPolicy`]: fail open (the default), fail closed, fall back to a local provider,
+//! or decide per failure.
+//!
+//! A Redis backend gives an exact limit across instances. Every instance that uses the same
+//! Redis and prefix shares the count. This login limit fails closed, so a Redis outage rejects
+//! logins:
+//!
+//! ```no_run
+//! # #[cfg(feature = "redis")]
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! use std::{sync::Arc, time::Duration};
+//!
+//! use actix_trypema::{BackendErrorPolicy, TrypemaLimiter, extract::PeerIp};
+//! use actix_trypema::trypema::{
+//!     RateLimit, RateLimiterBuilder, WindowSize,
+//!     redis::{AbsoluteRedisRateLimiter, RedisKey},
+//! };
+//! use actix_web::{App, web};
+//!
+//! let connection = redis::Client::open("redis://127.0.0.1:6379/")?
+//!     .get_connection_manager()
+//!     .await?;
+//!
+//! let backend: Arc<AbsoluteRedisRateLimiter> = RateLimiterBuilder::redis(connection)
+//!     .prefix(RedisKey::try_from("auth")?)
+//!     .window_size(WindowSize::minutes_or_panic(1))
+//!     .build()?;
+//!
+//! let limiter = TrypemaLimiter::builder(backend)
+//!     .namespace("login")
+//!     .extractor(PeerIp::default())
+//!     .rate(RateLimit::per_minute_or_panic(5.0))
+//!     .on_backend_error(BackendErrorPolicy::FailClosed)
+//!     .backend_timeout(Duration::from_millis(100))
+//!     .build()?;
+//!
+//! let app = App::new().service(
+//!     web::resource("/login")
+//!         .wrap(limiter.clone())
+//!         .route(web::post().to(|| async { "login" })),
+//! );
+//! # let _ = app;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! A hybrid backend decides most requests from local state and sends the counts to Redis at
+//! each sync interval. This API limit falls back to a local provider on the same window while
+//! Redis is not available, so each instance then limits on its own:
+//!
+//! ```no_run
+//! # #[cfg(feature = "redis")]
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! use std::sync::Arc;
+//!
+//! use actix_trypema::{BackendErrorPolicy, TrypemaLimiter, extract::PeerIp};
+//! use actix_trypema::trypema::{
+//!     RateLimit, RateLimiterBuilder, WindowSize,
+//!     hybrid::{AbsoluteHybridRateLimiter, SyncInterval},
+//!     local::LocalRateLimiterProvider,
+//!     redis::RedisKey,
+//! };
+//! use actix_web::{App, web};
+//!
+//! let window = WindowSize::minutes_or_panic(1);
+//! let connection = redis::Client::open("redis://127.0.0.1:6379/")?
+//!     .get_connection_manager()
+//!     .await?;
+//!
+//! let backend: Arc<AbsoluteHybridRateLimiter> = RateLimiterBuilder::hybrid(connection)
+//!     .prefix(RedisKey::try_from("api")?)
+//!     .window_size(window)
+//!     .sync_interval(SyncInterval::milliseconds_or_panic(50))
+//!     .build()?;
+//!
+//! let fallback: Arc<LocalRateLimiterProvider> = RateLimiterBuilder::local()
+//!     .window_size(window)
+//!     .build()?;
+//!
+//! let limiter = TrypemaLimiter::builder(backend)
+//!     .namespace("api")
+//!     .extractor(PeerIp::default())
+//!     .rate(RateLimit::per_minute_or_panic(600.0))
+//!     .on_backend_error(BackendErrorPolicy::Fallback(fallback))
+//!     .build()?;
+//!
+//! let app = App::new()
+//!     .wrap(limiter.clone())
+//!     .route("/", web::get().to(|| async { "hello" }));
+//! # let _ = app;
+//! # Ok(())
+//! # }
+//! ```
 //!
 //! # Keys
 //!
@@ -65,12 +172,16 @@
 //!   [`KeyExtractor`](extract::KeyExtractor) is the trait for your own extractors.
 //!
 //! ```
-//! use actix_trypema::{KeyError, Local, TrypemaLimiter, extract::{RealIp, TrustedProxies}};
+//! use std::sync::Arc;
+//!
+//! use actix_trypema::{KeyError, TrypemaLimiter, extract::{RealIp, TrustedProxies}};
+//! use actix_trypema::trypema::{RateLimit, RateLimiterBuilder, WindowSize, local::LocalRateLimiterProvider};
 //! use actix_web::HttpMessage;
-//! use trypema::{RateLimit, WindowSize};
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let backend = Local::new(WindowSize::seconds_or_panic(60))?;
+//! let backend: Arc<LocalRateLimiterProvider> = RateLimiterBuilder::local()
+//!     .window_size(WindowSize::seconds_or_panic(60))
+//!     .build()?;
 //!
 //! // Behind load balancers in 10.0.0.0/16: the client is the first untrusted address in
 //! // X-Forwarded-For, read from the right. Other peers are keyed by their own address.
@@ -108,12 +219,12 @@
 //! [`rate_fn`](TrypemaLimiterBuilder::rate_fn) sets per-request rates such as plan tiers (rates
 //! are sticky per key, so put the tier in the key), [`cost_fn`](TrypemaLimiterBuilder::cost_fn)
 //! charges expensive requests more, [`exclude`](TrypemaLimiterBuilder::exclude) skips requests,
-//! and [`Strategy::Suppressed`] sheds load gradually. [`HeaderMode`] picks the rate limit headers,
+//! and the suppressed strategy sheds load gradually. [`HeaderMode`] picks the rate limit headers,
 //! and a [`RejectionResponder`] builds the rejection body.
 //!
 //! [`permissive`](TrypemaLimiterBuilder::permissive) runs a limiter in shadow mode, and handlers
 //! read each decision through [`RateLimitInfo`]. [`derived_key`] returns the key a limiter
-//! stores, for resetting or re-rating one client through the backend's provider.
+//! stores, for resetting or re-rating one client through your backend value.
 //!
 //! # Middleware placement
 //!
@@ -127,8 +238,8 @@
 //!
 //! # Feature flags
 //!
-//! - `redis`: the Redis and hybrid backends, on trypema's tokio Redis client (the runtime
-//!   actix-web runs on).
+//! - `redis`: the Redis and hybrid backends (two providers and four limiters), on trypema's
+//!   tokio Redis client (the runtime actix-web runs on). It turns on `trypema/redis-tokio`.
 //! - `json`: a JSON rejection responder.
 //! - `metrics`: decision counters through the `metrics` facade — every request counts one of
 //!   admitted, rejected, or bypassed, and backend failures also count as errors — plus a
@@ -150,9 +261,11 @@ mod middleware;
 mod outcome;
 mod response;
 
+pub use trypema;
+
 #[cfg(feature = "redis")]
-pub use backend::{AsyncBackend, Hybrid, Redis};
-pub use backend::{Backend, Local};
+pub use backend::AsyncBackend;
+pub use backend::{Backend, ProviderBackend};
 pub use builder::{HeaderMode, Strategy, TrypemaLimiter, TrypemaLimiterBuilder};
 pub use error::{
     BackendErrorPolicy, BackendFailure, ConfigError, ErrorAction, KeyError, KeyErrorPolicy,

@@ -10,9 +10,9 @@ use actix_web::{
 };
 
 use crate::{
-    common::{CLIENT, get, per_ip, recorder::CountingRecorder},
+    common::{CLIENT, get, recorder::CountingRecorder},
     flaky_proxy::FlakyProxy,
-    support::{redis_backend, unique_prefix},
+    support::{per_ip, redis_backend, unique_prefix},
 };
 
 #[test]

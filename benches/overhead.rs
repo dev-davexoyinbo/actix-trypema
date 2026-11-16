@@ -2,20 +2,20 @@
 //!
 //! Every variant runs the same harness — build a test request, call the service — so the
 //! difference against `bare` is the limiter's own cost. Limits are far above the benchmark volume,
-//! so only the admit path is measured. With `--features redis`, the Redis and Hybrid variants run
+//! so only the admit path is measured. With `--features redis`, the Redis and hybrid variants run
 //! against `REDIS_URL` (default `redis://127.0.0.1:16379/`, see `compose.yaml`).
 
-use std::{net::SocketAddr, time::Instant};
+use std::{net::SocketAddr, sync::Arc, time::Instant};
 
 use actix_governor::{Governor, GovernorConfigBuilder};
-use actix_trypema::{Backend, HeaderMode, Local, TrypemaLimiter, extract::PeerIp};
+use actix_trypema::{Backend, HeaderMode, TrypemaLimiter, extract::PeerIp};
 use actix_web::{
     App,
     test::{self, TestRequest},
     web,
 };
 use criterion::{Criterion, criterion_group, criterion_main};
-use trypema::{RateLimit, WindowSize};
+use trypema::{RateLimit, RateLimiterBuilder, WindowSize, local::LocalRateLimiterProvider};
 
 const PEER: &str = "203.0.113.7:9000";
 
@@ -75,16 +75,21 @@ fn overhead(criterion: &mut Criterion) {
             .route("/", web::get().to(handler))
     );
 
+    let local: Arc<LocalRateLimiterProvider> = RateLimiterBuilder::local()
+        .window_size(window)
+        .build()
+        .unwrap();
+
     bench_app!(
         "trypema_local",
         App::new()
-            .wrap(limiter(Local::new(window).unwrap(), "local"))
+            .wrap(limiter(local, "local"))
             .route("/", web::get().to(handler))
     );
 
     #[cfg(feature = "redis")]
     {
-        use actix_trypema::{Hybrid, Redis};
+        use trypema::{hybrid::HybridRateLimiterProvider, redis::RedisRateLimiterProvider};
 
         let url =
             std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:16379/".to_string());
@@ -97,8 +102,18 @@ fn overhead(criterion: &mut Criterion) {
         });
 
         // Construction spawns the providers' background tasks, so it runs on the actix runtime.
-        let redis = runner.block_on(async { Redis::new(connection.clone(), window).unwrap() });
-        let hybrid = runner.block_on(async { Hybrid::new(connection, window).unwrap() });
+        let redis: Arc<RedisRateLimiterProvider> = runner.block_on(async {
+            RateLimiterBuilder::redis(connection.clone())
+                .window_size(window)
+                .build()
+                .unwrap()
+        });
+        let hybrid: Arc<HybridRateLimiterProvider> = runner.block_on(async {
+            RateLimiterBuilder::hybrid(connection)
+                .window_size(window)
+                .build()
+                .unwrap()
+        });
 
         bench_app!(
             "trypema_redis",
